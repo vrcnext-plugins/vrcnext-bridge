@@ -8,5 +8,7 @@ doc-valid-idents = [
     "SteamVR",
     "OpenXR",
     "OpenVR",
+    "WebSocket",
+    "WebSockets",
     "..",
 ]

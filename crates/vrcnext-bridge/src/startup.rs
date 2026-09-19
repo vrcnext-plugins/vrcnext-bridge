@@ -5,18 +5,52 @@
 
 use std::sync::Arc;
 
+use vrcnext_bridge_core::logs::{LogService, LogWriter, NullLogWriter};
 use vrcnext_bridge_core::notify::{NotifyService, SinkSet};
 use vrcnext_bridge_core::{Service, ServiceRegistry};
 use vrcnext_bridge_sinks::{FreedesktopSink, WayvrSink};
 
 use crate::config::{Config, SinkChoice};
+use crate::logfile::FileLogWriter;
+
+/// Everything the transport needs: the services, plus the log sink it shares with the stream.
+pub(crate) struct Wiring {
+    pub(crate) services: ServiceRegistry,
+    pub(crate) log_writer: Arc<dyn LogWriter>,
+}
 
 /// Build every service this bridge will offer.
 #[must_use]
-pub(crate) fn build_services(config: &Config) -> ServiceRegistry {
+pub(crate) fn build_services(config: &Config) -> Wiring {
+    let log_writer = build_log_writer(config);
+
     let mut registry = ServiceRegistry::new();
     registry.register(Arc::new(NotifyService::new(build_sinks(config))) as Arc<dyn Service>);
-    registry
+    registry.register(Arc::new(LogService::new(Arc::clone(&log_writer))) as Arc<dyn Service>);
+
+    Wiring {
+        services: registry,
+        log_writer,
+    }
+}
+
+/// Open the log file, or fall back to discarding.
+///
+/// A log file that cannot be opened must not stop the daemon: notifications are the primary job,
+/// and losing diagnostics is not worth refusing to start over. It is logged loudly instead.
+fn build_log_writer(config: &Config) -> Arc<dyn LogWriter> {
+    if config.no_log_capture {
+        log::info!("plugin log capture disabled by --no-log-capture");
+        return Arc::new(NullLogWriter);
+    }
+
+    match FileLogWriter::open(config.log_file.clone(), Some(config.log_max_bytes)) {
+        Ok(writer) => Arc::new(writer),
+        Err(error) => {
+            log::error!("plugin log capture unavailable: {error:#}");
+            Arc::new(NullLogWriter)
+        }
+    }
 }
 
 /// Bring up the requested sinks.
@@ -73,6 +107,15 @@ pub(crate) fn log_banner(config: &Config, services: &ServiceRegistry) {
             let health = target.get("health").and_then(|v| v.as_str()).unwrap_or("?");
             log::info!("  sink `{name}` [{health}] — {description}");
         }
+    }
+
+    if let Some(logs) = services
+        .describe()
+        .get("logs")
+        .and_then(|logs| logs.get("location"))
+        .and_then(serde_json::Value::as_str)
+    {
+        log::info!("plugin logs: {logs}");
     }
 
     if config.token.is_some() {

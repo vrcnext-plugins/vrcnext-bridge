@@ -63,6 +63,22 @@ pub(crate) struct Config {
     #[arg(long, default_value_t = 4)]
     pub(crate) threads: usize,
 
+    /// Where to write plugin logs. Defaults to a private per-user directory.
+    ///
+    /// Plugin log lines carry VRChat display names and instance ids, so the default lives under
+    /// `$XDG_RUNTIME_DIR` (or a `0700` directory under the temp dir) with the file itself `0600`.
+    /// Point this somewhere world-readable only if you mean to.
+    #[arg(long, env = "VRCNEXT_BRIDGE_LOG_FILE")]
+    pub(crate) log_file: Option<std::path::PathBuf>,
+
+    /// Rotate the plugin log once it passes this many bytes. One previous generation is kept.
+    #[arg(long, default_value_t = 8 * 1024 * 1024)]
+    pub(crate) log_max_bytes: u64,
+
+    /// Accept no plugin logs at all.
+    #[arg(long)]
+    pub(crate) no_log_capture: bool,
+
     /// Log level: error, warn, info, debug, trace.
     #[arg(long, default_value = "info", env = "VRCNEXT_BRIDGE_LOG")]
     pub(crate) log: String,

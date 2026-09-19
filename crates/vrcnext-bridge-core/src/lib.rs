@@ -38,10 +38,12 @@
 //! D-Bus session, a VR runtime or a listening socket.
 
 pub mod limits;
+pub mod logs;
 pub mod notify;
 pub mod ratelimit;
 pub mod service;
 
+pub use logs::{LogLevel, LogRecord, LogService, LogWriter, NullLogWriter};
 pub use notify::{
     Notification, NotifyRequest, NotifyService, Sink, SinkError, SinkHealth, Urgency,
     ValidationError,

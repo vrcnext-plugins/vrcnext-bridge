@@ -14,6 +14,7 @@
 
 mod config;
 mod http;
+mod logfile;
 mod startup;
 
 use anyhow::Result;
@@ -34,10 +35,10 @@ fn main() -> Result<()> {
         .format_timestamp_secs()
         .init();
 
-    let services = startup::build_services(&config);
-    startup::log_banner(&config, &services);
+    let wiring = startup::build_services(&config);
+    startup::log_banner(&config, &wiring.services);
 
-    let server = BridgeServer::bind(&config, services)?;
+    let server = BridgeServer::bind(&config, wiring.services, wiring.log_writer)?;
     log::info!("listening on http://{}", config.listen);
     server.serve()
 }

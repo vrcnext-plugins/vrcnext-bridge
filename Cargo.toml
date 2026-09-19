@@ -22,6 +22,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tiny_http = "0.12"
+# Protocol only — no TLS features, so this stays pure Rust and loopback-only.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 
 [workspace.lints.rust]

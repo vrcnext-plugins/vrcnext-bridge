@@ -7,6 +7,7 @@
 pub(crate) mod guard;
 pub(crate) mod respond;
 pub(crate) mod route;
+pub(crate) mod ws;
 
 use std::io::Read as _;
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use serde_json::Value;
 use tiny_http::{Header, Method, Request, Server};
+use vrcnext_bridge_core::logs::LogWriter;
 use vrcnext_bridge_core::{ServiceRegistry, limits};
 
 use crate::config::Config;
@@ -26,6 +28,7 @@ pub(crate) struct BridgeServer {
     server: Arc<Server>,
     guard: Arc<Guard>,
     services: Arc<ServiceRegistry>,
+    log_writer: Arc<dyn LogWriter>,
     threads: usize,
 }
 
@@ -35,7 +38,11 @@ impl BridgeServer {
     /// # Errors
     ///
     /// Fails if the address is already in use or cannot be bound.
-    pub(crate) fn bind(config: &Config, services: ServiceRegistry) -> Result<Self> {
+    pub(crate) fn bind(
+        config: &Config,
+        services: ServiceRegistry,
+        log_writer: Arc<dyn LogWriter>,
+    ) -> Result<Self> {
         let server = Server::http(config.listen)
             .map_err(|error| anyhow::anyhow!("{error}"))
             .with_context(|| format!("failed to listen on {}", config.listen))?;
@@ -44,6 +51,7 @@ impl BridgeServer {
             server: Arc::new(server),
             guard: Arc::new(Guard::new(config)),
             services: Arc::new(services),
+            log_writer,
             threads: config.worker_threads(),
         })
     }
@@ -63,9 +71,12 @@ impl BridgeServer {
                 let server = Arc::clone(&self.server);
                 let guard = Arc::clone(&self.guard);
                 let services = Arc::clone(&self.services);
+                let log_writer = Arc::clone(&self.log_writer);
                 std::thread::Builder::new()
                     .name(format!("bridge-worker-{index}"))
-                    .spawn_scoped(scope, move || worker(&server, &guard, &services))
+                    .spawn_scoped(scope, move || {
+                        worker(&server, &guard, &services, &log_writer);
+                    })
                     .context("failed to spawn worker thread")?;
             }
             Ok(())
@@ -78,7 +89,12 @@ impl BridgeServer {
 /// A panic while handling a request unwinds into [`std::panic::catch_unwind`] rather than taking
 /// the worker — and with it a share of the daemon's capacity — down with it. The lint set makes
 /// panics very unlikely; this is the backstop for the ones that are not.
-fn worker(server: &Server, guard: &Guard, services: &ServiceRegistry) {
+fn worker(
+    server: &Server,
+    guard: &Guard,
+    services: &ServiceRegistry,
+    log_writer: &Arc<dyn LogWriter>,
+) {
     loop {
         let request = match server.recv() {
             Ok(request) => request,
@@ -89,7 +105,7 @@ fn worker(server: &Server, guard: &Guard, services: &ServiceRegistry) {
         };
 
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle(request, guard, services);
+            handle(request, guard, services, log_writer);
         }));
         if outcome.is_err() {
             log::error!("a request handler panicked; the worker is continuing");
@@ -98,12 +114,24 @@ fn worker(server: &Server, guard: &Guard, services: &ServiceRegistry) {
 }
 
 /// Route, guard, dispatch, respond.
-fn handle(request: Request, guard: &Guard, services: &ServiceRegistry) {
+fn handle(
+    request: Request,
+    guard: &Guard,
+    services: &ServiceRegistry,
+    log_writer: &Arc<dyn LogWriter>,
+) {
     // An access log, at debug. Without it a working request is indistinguishable from one that
     // never arrived, which makes "is the page actually reaching me?" unanswerable — the first
     // question anyone debugging this will have. Only the method and path are logged: the path
     // carries no caller content, and the body may carry notification text.
     log::debug!("{} {}", request.method(), request.url());
+
+    // An upgrade is not a normal request: it has no body, answers 101, and CORS plays no part in
+    // protecting it. Route it before any of that machinery runs.
+    if Route::parse(request.url()) == Route::LogStream {
+        ws::serve_log_stream(request, guard, Arc::clone(log_writer));
+        return;
+    }
 
     let cors = cors_headers(
         guard::header(&request, "origin")

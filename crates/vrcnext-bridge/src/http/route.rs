@@ -7,6 +7,8 @@ pub(crate) enum Route {
     Health,
     /// `GET /v1/describe`
     Describe,
+    /// `GET /v1/logs/stream` — a WebSocket upgrade.
+    LogStream,
     /// `POST /v1/<service>/<method>`
     Call {
         /// Service name.
@@ -42,6 +44,7 @@ impl Route {
         match (first, segments.next(), segments.next()) {
             ("health", None, _) => Self::Health,
             ("describe", None, _) => Self::Describe,
+            ("logs", Some("stream"), None) => Self::LogStream,
             (service, Some(method), None) if is_name(service) && is_name(method) => Self::Call {
                 service: service.to_owned(),
                 method: method.to_owned(),
