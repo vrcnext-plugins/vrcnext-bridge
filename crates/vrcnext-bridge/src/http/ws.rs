@@ -110,6 +110,22 @@ fn pump(mut socket: WebSocket<Box<dyn tiny_http::ReadWrite + Send>>, writer: &Ar
     let broadcaster = LogBroadcaster::global();
     let (sub_id, log_rx) = broadcaster.subscribe();
 
+    // The drain below runs once per inbound frame, because `socket.read()` blocks.
+    //
+    // It cannot be otherwise here: `tiny_http::Request::upgrade` hands back an opaque
+    // `Box<dyn ReadWrite + Send>` — a `CustomStream` with no accessor for the underlying
+    // `TcpStream` — so there is nowhere to call `set_nonblocking` or `set_read_timeout`. The
+    // `WouldBlock` arm further down is therefore unreachable with this transport. It is kept
+    // because it is correct for any transport that *can* time out, and costs nothing.
+    //
+    // KNOWN LIMITATION, deliberately not worked around here: while the page is quiet the drain
+    // does not run, so daemon→client broadcasts sit unsent until the client happens to send
+    // something. Measured: an idle client received nothing for 4s, then the whole backlog
+    // arrived the instant it sent one frame.
+    //
+    // A client-side keepalive would paper over it, at the cost of a frame per second forever.
+    // `tokio::select!` over the socket and the broadcast channel removes the problem by
+    // construction, which is a large part of why the async rewrite is worth doing.
     loop {
         // 1. Drain pending bridge logs and send to client as a LogWriteRequest JSON text frame
         let mut broadcast_batch: Vec<BroadcastRecord> = Vec::new();
@@ -131,7 +147,7 @@ fn pump(mut socket: WebSocket<Box<dyn tiny_http::ReadWrite + Send>>, writer: &Ar
             }
         }
 
-        // 2. Read incoming frame from socket (non-blocking / fast check if possible)
+        // 2. Block until the client sends something — a real batch, or its keepalive.
         let message = match socket.read() {
             Ok(message) => message,
             Err(tungstenite::Error::Io(ref err))
