@@ -99,6 +99,12 @@ fn worker(server: &Server, guard: &Guard, services: &ServiceRegistry) {
 
 /// Route, guard, dispatch, respond.
 fn handle(request: Request, guard: &Guard, services: &ServiceRegistry) {
+    // An access log, at debug. Without it a working request is indistinguishable from one that
+    // never arrived, which makes "is the page actually reaching me?" unanswerable — the first
+    // question anyone debugging this will have. Only the method and path are logged: the path
+    // carries no caller content, and the body may carry notification text.
+    log::debug!("{} {}", request.method(), request.url());
+
     let cors = cors_headers(
         guard::header(&request, "origin")
             .filter(|origin| guard.origins().allows(origin))
