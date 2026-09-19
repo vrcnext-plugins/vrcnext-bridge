@@ -277,7 +277,17 @@ impl NotifyRequest {
         self.sinks.as_deref()
     }
 
-    fn check_sink_names(&self) -> Result<(), ValidationError> {
+    /// Bound the `sinks` list on its own, ahead of full validation.
+    ///
+    /// Separate from [`NotifyRequest::validate`] because sink names are consumed earlier than
+    /// everything else — they choose the targets, and target selection has to happen before a
+    /// per-target validation pass is even possible. Without this, an unbounded name would reach
+    /// the unknown-sink error message.
+    ///
+    /// # Errors
+    ///
+    /// [`ValidationError::TooManySinks`] or [`ValidationError::BadSinkName`].
+    pub fn check_sink_names(&self) -> Result<(), ValidationError> {
         let Some(sinks) = &self.sinks else {
             return Ok(());
         };

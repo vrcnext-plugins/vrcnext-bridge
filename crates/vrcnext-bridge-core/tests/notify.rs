@@ -208,6 +208,38 @@ fn an_unknown_sink_is_a_400_naming_what_exists() {
 }
 
 #[test]
+fn an_over_long_sink_name_is_not_echoed_back() {
+    let service = service_with(vec![Recorder::new("wayvr") as Arc<dyn Sink>]);
+    let huge = "x".repeat(100_000);
+
+    let error = service
+        .call("send", json!({ "title": "t", "sinks": [huge.clone()] }))
+        .expect_err("should refuse");
+
+    assert_eq!(error.status(), 400);
+    let message = error.to_string();
+    assert!(
+        message.len() < 200,
+        "error messages must not reflect an unbounded caller string; got {} bytes",
+        message.len()
+    );
+    assert!(!message.contains(&huge));
+}
+
+#[test]
+fn an_empty_sink_list_is_the_callers_error_not_a_missing_daemon() {
+    let service = service_with(vec![Recorder::new("wayvr") as Arc<dyn Sink>]);
+
+    let error = service
+        .call("send", json!({ "title": "t", "sinks": [] }))
+        .expect_err("should refuse");
+
+    // 400, not 503: the bridge has a sink, the caller just asked for none of them.
+    assert_eq!(error.status(), 400);
+    assert!(error.to_string().contains("omit it"), "{error}");
+}
+
+#[test]
 fn a_bridge_with_no_sinks_says_so_rather_than_claiming_success() {
     let service = service_with(vec![]);
     let error = service

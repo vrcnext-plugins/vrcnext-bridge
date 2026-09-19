@@ -7,6 +7,9 @@ use serde_json::Value;
 use crate::notify::proto::ResolvedNotify;
 use crate::notify::sink::Sink;
 
+/// Hard ceiling on how much of a caller-supplied sink name an error may quote back.
+const MAX_ECHOED_NAME_CHARS: usize = 32;
+
 /// The sinks this bridge instance was started with, in registration order.
 #[derive(Default, Clone)]
 pub struct SinkSet {
@@ -45,11 +48,13 @@ impl SinkSet {
     ///
     /// # Errors
     ///
-    /// Returns a caller-facing message naming the unknown sink and listing what does exist. The
-    /// echoed name is safe to include because [`NotifyRequest::validate`] has already bounded it
-    /// to a short string.
+    /// Returns a caller-facing message naming the unknown sink and listing what does exist.
     ///
-    /// [`NotifyRequest::validate`]: crate::notify::NotifyRequest::validate
+    /// The echoed name is truncated here rather than trusted. Callers are expected to have run
+    /// [`NotifyRequest::check_sink_names`] first, but this is public API and an error message is
+    /// the last place that should reflect an unbounded caller-supplied string.
+    ///
+    /// [`NotifyRequest::check_sink_names`]: crate::notify::NotifyRequest::check_sink_names
     pub fn select(&self, requested: Option<&[String]>) -> Result<Vec<Arc<dyn Sink>>, String> {
         let Some(requested) = requested else {
             return Ok(self.sinks.clone());
@@ -62,9 +67,10 @@ impl SinkSet {
                 .iter()
                 .find(|sink| sink.name() == name)
                 .ok_or_else(|| {
+                    let shown: String = name.chars().take(MAX_ECHOED_NAME_CHARS).collect();
                     format!(
                         "unknown sink `{}`; this bridge has: {}",
-                        name.escape_debug(),
+                        shown.escape_debug(),
                         self.names().join(", ")
                     )
                 })?;

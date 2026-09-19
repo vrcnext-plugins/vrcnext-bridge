@@ -46,6 +46,8 @@ pub(crate) enum Refusal {
     UnsupportedMediaType,
     /// The body exceeded the size limit.
     PayloadTooLarge,
+    /// The body was not valid UTF-8.
+    MalformedBody,
     /// The rate limit was hit.
     RateLimited(Duration),
 }
@@ -59,6 +61,7 @@ impl Refusal {
             Self::Unauthorized => 401,
             Self::UnsupportedMediaType => 415,
             Self::PayloadTooLarge => 413,
+            Self::MalformedBody => 400,
             Self::RateLimited(_) => 429,
         }
     }
@@ -71,6 +74,7 @@ impl Refusal {
             Self::Unauthorized => "unauthorized",
             Self::UnsupportedMediaType => "unsupported_media_type",
             Self::PayloadTooLarge => "payload_too_large",
+            Self::MalformedBody => "malformed_body",
             Self::RateLimited(_) => "rate_limited",
         }
     }
@@ -83,6 +87,7 @@ impl Refusal {
             Self::Unauthorized => "a valid bearer token is required",
             Self::UnsupportedMediaType => "request body must be application/json",
             Self::PayloadTooLarge => "request body is too large",
+            Self::MalformedBody => "request body must be valid UTF-8",
             Self::RateLimited(_) => "too many requests",
         }
     }
@@ -168,6 +173,23 @@ impl Guard {
         &self.origins
     }
 
+    /// Take a rate-limit token.
+    ///
+    /// Applies to **every** request, not just the ones that deliver something. `/v1/health` is
+    /// cheap, but "cheap" times an unbounded request rate is still a busy loop in a daemon the
+    /// user did not ask to think about.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::RateLimited`] when the bucket is empty.
+    pub(crate) fn check_rate(&self) -> Result<(), Refusal> {
+        if self.limiter.try_acquire() {
+            Ok(())
+        } else {
+            Err(Refusal::RateLimited(self.limiter.retry_after()))
+        }
+    }
+
     /// Check origin and credentials. Applies to preflights as well as real requests.
     ///
     /// # Errors
@@ -196,9 +218,10 @@ impl Guard {
     /// # Errors
     ///
     /// [`Refusal::UnsupportedMediaType`] if the content type is wrong — which is also what forces
-    /// browsers to preflight — [`Refusal::PayloadTooLarge`] if the declared length is over the
-    /// limit, or [`Refusal::RateLimited`] if the bucket is empty.
-    pub(crate) fn check_body(&self, request: &Request, max_bytes: usize) -> Result<(), Refusal> {
+    /// browsers to preflight — or [`Refusal::PayloadTooLarge`] if the declared length is over the
+    /// limit. Rate limiting is handled separately by [`Guard::check_rate`], which covers every
+    /// request rather than only those with a body.
+    pub(crate) fn check_body(request: &Request, max_bytes: usize) -> Result<(), Refusal> {
         let content_type = header(request, "content-type").unwrap_or_default();
         let base = content_type
             .split(';')
@@ -215,10 +238,6 @@ impl Guard {
             .is_some_and(|declared| declared > max_bytes)
         {
             return Err(Refusal::PayloadTooLarge);
-        }
-
-        if !self.limiter.try_acquire() {
-            return Err(Refusal::RateLimited(self.limiter.retry_after()));
         }
         Ok(())
     }

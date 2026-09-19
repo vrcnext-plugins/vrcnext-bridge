@@ -47,15 +47,31 @@ impl NotifyService {
         let request: NotifyRequest = serde_json::from_value(params)
             .map_err(|error| ServiceError::BadRequest(error.to_string()))?;
 
+        // Before selection, because selection consumes the names and its error message quotes
+        // them. Everything else is validated later, once the targets are known.
+        request
+            .check_sink_names()
+            .map_err(|error| ServiceError::BadRequest(error.to_string()))?;
+
         let targets = self
             .sinks
             .select(request.requested_sinks())
             .map_err(ServiceError::BadRequest)?;
+
         if targets.is_empty() {
-            return Err(ServiceError::Unavailable(
-                "no notification sinks are configured; start the bridge with at least one"
-                    .to_owned(),
-            ));
+            // Two different failures that would otherwise look identical: the caller asked for no
+            // targets (their bug, 400), or this bridge has none configured (the operator's, 503).
+            return Err(if request.requested_sinks().is_some() {
+                ServiceError::BadRequest(
+                    "`sinks` was empty; omit it to reach every target, or name at least one"
+                        .to_owned(),
+                )
+            } else {
+                ServiceError::Unavailable(
+                    "no notification sinks are configured; start the bridge with at least one"
+                        .to_owned(),
+                )
+            });
         }
 
         let names: Vec<&str> = targets.iter().map(|sink| sink.name()).collect();

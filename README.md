@@ -116,11 +116,15 @@ What is done about it:
 - **Everything is bounded.** Body size, string lengths (in characters, not bytes), float finiteness
   and ranges, sink-name lengths, path-segment shape. A `Notification` can only be constructed by
   validation, so sinks never handle an unchecked value.
-- **Rate limited.** A token bucket, 5/s with a burst of 10 by default. A runaway loop is an
-  accident that otherwise needs the user to take the headset off.
+- **Rate limited, on every endpoint.** A token bucket, 5/s with a burst of 10 by default, applied
+  to health checks and preflights too — `/v1/health` is cheap, but cheap times an unbounded request
+  rate is still a busy loop. A runaway `notify` loop is an accident that otherwise needs the user to
+  take the headset off.
 - **`unsafe_code = "forbid"`**, workspace-wide, alongside clippy `pedantic` with `unwrap_used`,
   `expect_used`, `panic` and `indexing_slicing` denied outside tests.
-- **Error messages never echo caller input**, except a sink name already bounded to 32 characters.
+- **Error messages never echo caller input.** The one exception — an unknown sink's name — is both
+  validated before selection and truncated at the point of formatting, because an error message is
+  the last place that should reflect an unbounded caller-supplied string.
 
 An optional `--token` adds a bearer check for shared or multi-user machines, where the assumption
 behind class (2) stops holding.

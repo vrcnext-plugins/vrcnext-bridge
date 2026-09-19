@@ -111,8 +111,16 @@ fn handle(request: Request, guard: &Guard, services: &ServiceRegistry) {
             .as_deref(),
     );
 
-    if let Err(refusal) = guard.check_admission(&request) {
-        reply_json(request, refusal.status(), &refusal_body(&refusal), &cors);
+    if let Err(refusal) = guard
+        .check_rate()
+        .and_then(|()| guard.check_admission(&request))
+    {
+        reply_json(
+            request,
+            refusal.status(),
+            &refusal_body(&refusal),
+            &with_retry_after(cors, &refusal),
+        );
         return;
     }
 
@@ -133,7 +141,7 @@ fn handle(request: Request, guard: &Guard, services: &ServiceRegistry) {
             reply_json(request, 200, &body, &cors);
         }
         (Method::Post, Route::Call { service, method }) => {
-            dispatch(request, guard, services, &service, &method, cors);
+            dispatch(request, services, &service, &method, &cors);
         }
         (_, Route::NotFound) => {
             reply_json(
@@ -153,37 +161,29 @@ fn handle(request: Request, guard: &Guard, services: &ServiceRegistry) {
 /// Read the body under the size cap and hand it to a service.
 fn dispatch(
     mut request: Request,
-    guard: &Guard,
     services: &ServiceRegistry,
     service: &str,
     method: &str,
-    cors: Vec<Header>,
+    cors: &[Header],
 ) {
-    if let Err(refusal) = guard.check_body(&request, limits::MAX_BODY_BYTES) {
-        let mut headers = cors;
-        if let Refusal::RateLimited(after) = &refusal {
-            let seconds = after.as_secs().max(1).to_string();
-            if let Some(header) = guard::make_header("Retry-After", &seconds) {
-                headers.push(header);
-            }
-        }
-        reply_json(request, refusal.status(), &refusal_body(&refusal), &headers);
+    if let Err(refusal) = Guard::check_body(&request, limits::MAX_BODY_BYTES) {
+        reply_json(request, refusal.status(), &refusal_body(&refusal), cors);
         return;
     }
 
     let params = match read_params(&mut request) {
         Ok(params) => params,
         Err((status, body)) => {
-            reply_json(request, status, &body, &cors);
+            reply_json(request, status, &body, cors);
             return;
         }
     };
 
     match services.call(service, method, params) {
-        Ok(value) => reply_json(request, 200, &value, &cors),
+        Ok(value) => reply_json(request, 200, &value, cors),
         Err(error) => {
             let body = error_body(error.code(), &error.to_string());
-            reply_json(request, error.status(), &body, &cors);
+            reply_json(request, error.status(), &body, cors);
         }
     }
 }
@@ -208,6 +208,16 @@ fn read_params(request: &mut Request) -> Result<Value, (u16, Value)> {
 ///
 /// `Read::take` bounds this independently of the `Content-Length` header, so a caller that lies
 /// about its length — or sends none at all — still cannot push unbounded bytes into memory.
+fn with_retry_after(mut headers: Vec<Header>, refusal: &Refusal) -> Vec<Header> {
+    if let Refusal::RateLimited(after) = refusal {
+        let seconds = after.as_secs().max(1).to_string();
+        if let Some(header) = guard::make_header("Retry-After", &seconds) {
+            headers.push(header);
+        }
+    }
+    headers
+}
+
 fn read_body(request: &mut Request, max: usize) -> Result<String, Refusal> {
     let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
     let mut buffer = Vec::new();
@@ -222,7 +232,7 @@ fn read_body(request: &mut Request, max: usize) -> Result<String, Refusal> {
     if buffer.len() > max {
         return Err(Refusal::PayloadTooLarge);
     }
-    String::from_utf8(buffer).map_err(|_| Refusal::PayloadTooLarge)
+    String::from_utf8(buffer).map_err(|_| Refusal::MalformedBody)
 }
 
 fn health_body(services: &ServiceRegistry) -> Value {
