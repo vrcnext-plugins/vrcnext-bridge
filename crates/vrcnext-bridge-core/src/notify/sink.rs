@@ -35,8 +35,10 @@ pub enum SinkError {
 
 /// Whether a sink believes it can currently deliver.
 ///
-/// Advisory only. Fire-and-forget UDP cannot know whether anything is listening, so
-/// [`SinkHealth::Unknown`] is the honest answer there rather than a fabricated `Up`.
+/// Advisory only, and each sink should say what its answer actually proves. A UDP sink cannot
+/// confirm delivery, but it can often tell whether anything holds the port — a trustworthy
+/// negative and a weaker positive. [`SinkHealth::Unknown`] stays the honest answer wherever even
+/// that is unavailable, rather than a fabricated `Up`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinkHealth {
     /// Connected, and a receiver is known to exist.

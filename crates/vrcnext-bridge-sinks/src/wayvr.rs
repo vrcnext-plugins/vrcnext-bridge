@@ -135,27 +135,51 @@ impl WayvrSink {
         Ok(bytes)
     }
 
-    /// Check `/proc/net/udp` and `/proc/net/udp6` on Linux to determine if any process
-    /// is listening on the given UDP port.
+    /// Whether **any** local socket holds `port`, according to `/proc/net/udp{,6}`.
+    ///
+    /// # What this does and does not tell you
+    ///
+    /// It answers "is that port taken", not "is WayVR listening and will it render". A different
+    /// program squatting the port reads as `Up`. The useful half is the negative: nothing bound
+    /// means a datagram is definitely going nowhere, which is worth surfacing.
+    ///
+    /// Only the port is compared, not the address. A socket bound to another interface entirely
+    /// would be a false positive; matching the address would mean decoding `/proc`'s
+    /// endian-swapped hex for v4, v6 and v4-mapped-v6, and then still having to treat wildcard
+    /// binds as matches. Not worth the failure modes for an advisory signal.
+    ///
+    /// Returns `None` only when neither table could be read at all.
     #[cfg(target_os = "linux")]
     fn is_listener_bound(port: u16) -> Option<bool> {
-        let hex_port = format!("{port:04X}");
+        let suffix = format!(":{port:04X}");
+        let mut read_any = false;
+
         for path in ["/proc/net/udp", "/proc/net/udp6"] {
-            let content = std::fs::read_to_string(path).ok()?;
+            // A missing table is not a failure. IPv6 is routinely disabled, and letting that
+            // discard a definitive answer from the IPv4 table reported Unknown on hosts where
+            // the truth was perfectly knowable.
+            let Ok(content) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            read_any = true;
+
             for line in content.lines().skip(1) {
-                let mut parts = line.split_whitespace();
-                let (_sl, local, remote, state) =
-                    (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
-                // State "07" in /proc/net/udp corresponds to TCP_CLOSE, representing a listening/unconnected UDP socket.
-                if state == "07"
-                    && local.ends_with(&format!(":{hex_port}"))
-                    && (remote == "00000000:0000" || remote.ends_with(":0000"))
+                // `sl local_address rem_address st …` — the local address is the second column.
+                //
+                // The state column is deliberately not filtered on. A socket that has called
+                // connect() shows `01` rather than `07`, and it still owns the port; requiring
+                // `07` silently missed those.
+                if line
+                    .split_whitespace()
+                    .nth(1)
+                    .is_some_and(|local| local.ends_with(&suffix))
                 {
                     return Some(true);
                 }
             }
         }
-        Some(false)
+
+        read_any.then_some(false)
     }
 }
 
@@ -185,9 +209,11 @@ impl Sink for WayvrSink {
         ]
     }
 
-    /// [`SinkHealth::Up`] if a local UDP listener is bound to the target address,
-    /// [`SinkHealth::Down`] if nothing is listening on that port, or [`SinkHealth::Unknown`]
-    /// if listener presence cannot be determined.
+    /// [`SinkHealth::Up`] if some local socket holds the target port, [`SinkHealth::Down`] if
+    /// nothing does, or [`SinkHealth::Unknown`] where that cannot be determined.
+    ///
+    /// See [`WayvrSink::is_listener_bound`] for what this genuinely proves — the negative is
+    /// trustworthy, the positive is only "the port is taken".
     fn health(&self) -> SinkHealth {
         #[cfg(target_os = "linux")]
         {
@@ -309,19 +335,49 @@ mod tests {
         assert_eq!(addr.port(), 42069);
     }
 
+    /// The probe must be tested against a port the test itself controls.
+    ///
+    /// The original version asserted `Down` for WayVR's real port and then tried to bind it. That
+    /// inverts whenever WayVR is actually running — the one configuration this feature exists to
+    /// serve — so the suite went red exactly when the software worked. It passed in CI only
+    /// because nothing was listening there.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn health_reflects_listener_presence() {
-        let addr = DEFAULT_WAYVR_ADDR.parse().expect("addr");
-        let sink = WayvrSink::bind(addr).expect("bind");
-        // On Linux, with nothing listening on 42069, it should report Down.
-        #[cfg(target_os = "linux")]
-        assert_eq!(sink.health(), vrcnext_bridge_core::SinkHealth::Down);
+    fn the_probe_sees_a_listener_appear_and_disappear() {
+        // Port 0 lets the OS pick one that is definitely free, removing the assumption entirely.
+        let listener = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind probe socket");
+        let port = listener.local_addr().expect("local addr").port();
 
-        // Binding a test listener should make it report Up.
-        let listener = std::net::UdpSocket::bind("127.0.0.1:42069");
-        if let Ok(_listener) = listener {
-            #[cfg(target_os = "linux")]
-            assert_eq!(sink.health(), vrcnext_bridge_core::SinkHealth::Up);
+        assert_eq!(
+            WayvrSink::is_listener_bound(port),
+            Some(true),
+            "a socket we are holding open must read as bound"
+        );
+
+        drop(listener);
+        assert_eq!(
+            WayvrSink::is_listener_bound(port),
+            Some(false),
+            "the same port must read as free once released"
+        );
+    }
+
+    /// Health is derived from the probe, whatever the machine happens to be running.
+    #[test]
+    fn health_agrees_with_the_probe() {
+        let addr: std::net::SocketAddr = DEFAULT_WAYVR_ADDR.parse().expect("addr");
+        let sink = WayvrSink::bind(addr).expect("bind");
+
+        #[cfg(target_os = "linux")]
+        {
+            let expected = match WayvrSink::is_listener_bound(addr.port()) {
+                Some(true) => vrcnext_bridge_core::SinkHealth::Up,
+                Some(false) => vrcnext_bridge_core::SinkHealth::Down,
+                None => vrcnext_bridge_core::SinkHealth::Unknown,
+            };
+            assert_eq!(sink.health(), expected);
         }
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(sink.health(), vrcnext_bridge_core::SinkHealth::Unknown);
     }
 }
