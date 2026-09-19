@@ -12,12 +12,14 @@
 //! Run `vrcnext-bridge --help` for options, or `GET /v1/describe` for what a running instance
 //! actually offers.
 
+mod broadcast;
 mod config;
 mod http;
 mod logfile;
 mod startup;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
+use broadcast::BroadcastLogger;
 use clap::Parser as _;
 
 use config::Config;
@@ -30,10 +32,14 @@ fn main() -> Result<()> {
     let config = Config::parse();
     config.validate()?;
 
-    env_logger::Builder::new()
+    let logger = env_logger::Builder::new()
         .parse_filters(&config.log)
         .format_timestamp_secs()
-        .init();
+        .build();
+
+    BroadcastLogger::new(logger)
+        .init()
+        .context("failed to initialise logger")?;
 
     let wiring = startup::build_services(&config);
     startup::log_banner(&config, &wiring.services);

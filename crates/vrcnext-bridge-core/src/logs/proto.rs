@@ -44,7 +44,7 @@ impl LogLevel {
 }
 
 /// One inbound record. Untrusted.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LogRecordIn {
     /// Severity.
@@ -62,7 +62,7 @@ pub struct LogRecordIn {
 }
 
 /// A batch, as posted or streamed.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LogWriteRequest {
     /// The records to append.
@@ -70,7 +70,8 @@ pub struct LogWriteRequest {
 }
 
 /// A validated record. Construct only via [`LogWriteRequest::validate`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct LogRecord {
     /// Severity.

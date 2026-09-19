@@ -98,15 +98,49 @@ fn respond_plain(request: Request, status: u16, body: &str) {
     }
 }
 
-/// Read frames until the peer goes away.
+use crate::broadcast::{BroadcastRecord, LogBroadcaster};
+use std::time::Duration;
+
+/// Read frames until the peer goes away, and stream daemon logs to the client.
 fn pump(mut socket: WebSocket<Box<dyn tiny_http::ReadWrite + Send>>, writer: &Arc<dyn LogWriter>) {
     log::info!("log stream opened; writing to {}", writer.location());
     let limiter = RateLimiter::new(FRAMES_PER_SECOND, FRAME_BURST);
     let mut written: u64 = 0;
 
+    let broadcaster = LogBroadcaster::global();
+    let (sub_id, log_rx) = broadcaster.subscribe();
+
     loop {
+        // 1. Drain pending bridge logs and send to client as a LogWriteRequest JSON text frame
+        let mut broadcast_batch: Vec<BroadcastRecord> = Vec::new();
+        while let Ok(rec) = log_rx.try_recv() {
+            broadcast_batch.push(rec);
+            if broadcast_batch.len() >= 50 {
+                break;
+            }
+        }
+
+        if !broadcast_batch.is_empty() {
+            let payload = serde_json::json!({
+                "records": broadcast_batch
+            });
+            if let Ok(text) = serde_json::to_string(&payload) {
+                if socket.write(Message::Text(text.into())).is_err() || socket.flush().is_err() {
+                    break;
+                }
+            }
+        }
+
+        // 2. Read incoming frame from socket (non-blocking / fast check if possible)
         let message = match socket.read() {
             Ok(message) => message,
+            Err(tungstenite::Error::Io(ref err))
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                std::thread::sleep(Duration::from_millis(25));
+                continue;
+            }
             Err(error) => {
                 log::debug!("log stream closed: {error}");
                 break;
@@ -136,6 +170,7 @@ fn pump(mut socket: WebSocket<Box<dyn tiny_http::ReadWrite + Send>>, writer: &Ar
         }
     }
 
+    broadcaster.unsubscribe(sub_id);
     log::info!("log stream ended after {written} record(s)");
 }
 

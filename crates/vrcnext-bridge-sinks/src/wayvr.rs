@@ -134,6 +134,29 @@ impl WayvrSink {
         }
         Ok(bytes)
     }
+
+    /// Check `/proc/net/udp` and `/proc/net/udp6` on Linux to determine if any process
+    /// is listening on the given UDP port.
+    #[cfg(target_os = "linux")]
+    fn is_listener_bound(port: u16) -> Option<bool> {
+        let hex_port = format!("{port:04X}");
+        for path in ["/proc/net/udp", "/proc/net/udp6"] {
+            let content = std::fs::read_to_string(path).ok()?;
+            for line in content.lines().skip(1) {
+                let mut parts = line.split_whitespace();
+                let (_sl, local, remote, state) =
+                    (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+                // State "07" in /proc/net/udp corresponds to TCP_CLOSE, representing a listening/unconnected UDP socket.
+                if state == "07"
+                    && local.ends_with(&format!(":{hex_port}"))
+                    && (remote == "00000000:0000" || remote.ends_with(":0000"))
+                {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
+    }
 }
 
 impl Sink for WayvrSink {
@@ -162,12 +185,22 @@ impl Sink for WayvrSink {
         ]
     }
 
-    /// Always [`SinkHealth::Unknown`].
-    ///
-    /// UDP is fire-and-forget: the socket being open says nothing about whether an overlay is
-    /// listening on the other side. Reporting `Up` here would be a guess dressed as a fact.
+    /// [`SinkHealth::Up`] if a local UDP listener is bound to the target address,
+    /// [`SinkHealth::Down`] if nothing is listening on that port, or [`SinkHealth::Unknown`]
+    /// if listener presence cannot be determined.
     fn health(&self) -> SinkHealth {
-        SinkHealth::Unknown
+        #[cfg(target_os = "linux")]
+        {
+            match Self::is_listener_bound(self.addr.port()) {
+                Some(true) => SinkHealth::Up,
+                Some(false) => SinkHealth::Down,
+                None => SinkHealth::Unknown,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            SinkHealth::Unknown
+        }
     }
 
     fn deliver(&self, notification: &Notification) -> Result<(), SinkError> {
@@ -277,9 +310,18 @@ mod tests {
     }
 
     #[test]
-    fn health_is_unknown_because_udp_cannot_know() {
+    fn health_reflects_listener_presence() {
         let addr = DEFAULT_WAYVR_ADDR.parse().expect("addr");
         let sink = WayvrSink::bind(addr).expect("bind");
-        assert_eq!(sink.health(), vrcnext_bridge_core::SinkHealth::Unknown);
+        // On Linux, with nothing listening on 42069, it should report Down.
+        #[cfg(target_os = "linux")]
+        assert_eq!(sink.health(), vrcnext_bridge_core::SinkHealth::Down);
+
+        // Binding a test listener should make it report Up.
+        let listener = std::net::UdpSocket::bind("127.0.0.1:42069");
+        if let Ok(_listener) = listener {
+            #[cfg(target_os = "linux")]
+            assert_eq!(sink.health(), vrcnext_bridge_core::SinkHealth::Up);
+        }
     }
 }

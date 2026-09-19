@@ -204,7 +204,7 @@ fn open_private_append(path: &Path) -> std::io::Result<File> {
     clippy::integer_division,
     reason = "calendar arithmetic on whole seconds and days"
 )]
-fn iso_timestamp() -> String {
+pub(crate) fn iso_timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
