@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Unlicense"
+repository = "https://github.com/vrcnext-plugins/vrcnext-bridge"
+authors = ["vrcnext-plugins"]
+
+[workspace.dependencies]
+vrcnext-bridge-core = { path = "crates/vrcnext-bridge-core", version = "0.1.0" }
+vrcnext-bridge-sinks = { path = "crates/vrcnext-bridge-sinks", version = "0.1.0" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tiny_http = "0.12"
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+integer_division = "deny"
+too_many_lines = "deny"
+cast_possible_truncation = "deny"
+cast_precision_loss = "deny"
+cast_sign_loss = "deny"
+float_cmp = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+dbg_macro = "deny"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+# Deliberately *not* `panic = "abort"`. This is a long-lived daemon: a residual panic in one
+# worker thread must cost that one request, not the whole process. The request loop unwinds it.

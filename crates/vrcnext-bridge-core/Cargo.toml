@@ -1,0 +1,18 @@
+[package]
+name = "vrcnext-bridge-core"
+description = "Wire protocol, validation and sink abstraction for vrcnext-bridge. No I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

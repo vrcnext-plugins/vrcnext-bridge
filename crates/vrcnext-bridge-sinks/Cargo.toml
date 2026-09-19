@@ -1,0 +1,20 @@
+[package]
+name = "vrcnext-bridge-sinks"
+description = "Concrete notification sinks for vrcnext-bridge: WayVR (UDP) and freedesktop (D-Bus)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+vrcnext-bridge-core.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zbus.workspace = true
+
+[lints]
+workspace = true

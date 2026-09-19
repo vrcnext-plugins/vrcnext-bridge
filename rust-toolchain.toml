@@ -1,0 +1,5 @@
+[toolchain]
+# Pinned so the lint set behaves identically for everyone; clippy's pedantic group moves between
+# releases, and a gate that passes locally must pass in CI.
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

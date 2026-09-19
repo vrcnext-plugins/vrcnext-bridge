@@ -1,0 +1,12 @@
+# Proper nouns that clippy::doc_markdown would otherwise want wrapped in backticks. They are
+# product names in prose, not code items, so backticking them would read worse.
+doc-valid-idents = [
+    "VRCNext",
+    "VRChat",
+    "WayVR",
+    "XSOverlay",
+    "SteamVR",
+    "OpenXR",
+    "OpenVR",
+    "..",
+]
