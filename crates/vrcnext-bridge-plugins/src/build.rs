@@ -31,6 +31,10 @@ pub const ESBUILD_DEADLINE: Duration = Duration::from_secs(60);
 const HOST_ENTRY: &str = "host/packages/host/src/index.ts";
 
 /// What `@vrcnext/plugin-api` resolves to.
+/// The only compiler options esbuild is allowed to see. Mirrored in the host repo's scripts/build.sh.
+const TSCONFIG_RAW: &str =
+    r#"{"compilerOptions":{"target":"es2022","useDefineForClassFields":true}}"#;
+
 const API_ENTRY: &str = "host/packages/api/src/index.ts";
 
 /// What `@vrcnext/static-plugins` resolves to, relative to the data root.
@@ -223,6 +227,10 @@ fn esbuild_args(outfile: &Path) -> Vec<String> {
         "--bundle".to_owned(),
         "--format=iife".to_owned(),
         "--target=es2022".to_owned(),
+        // Compiler options are given inline so the build never depends on a tsconfig.json being
+        // present: the host tarball ships only sources, and a plugin's own tsconfig must not be
+        // able to change how the bundle is compiled.
+        format!("--tsconfig-raw={TSCONFIG_RAW}"),
         "--platform=browser".to_owned(),
         "--minify".to_owned(),
         "--sourcemap=linked".to_owned(),
