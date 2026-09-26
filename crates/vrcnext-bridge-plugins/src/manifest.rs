@@ -80,6 +80,9 @@ pub struct Manifest {
     /// Exact hosts; no wildcards.
     #[serde(default)]
     pub hosts: Vec<String>,
+    /// Plugin ids that must be enabled first. The host orders activation by these.
+    #[serde(default)]
+    pub dependencies: Vec<String>,
 }
 
 /// Why a manifest was refused. The message is what `manifest_invalid: …` carries.
@@ -148,6 +151,12 @@ impl Manifest {
         list("actions", &self.actions, MAX_LIST_ENTRIES, is_exact_name)?;
         list("events", &self.events, MAX_LIST_ENTRIES, is_exact_name)?;
         list("hosts", &self.hosts, MAX_LIST_ENTRIES, is_exact_host)?;
+        list("dependencies", &self.dependencies, MAX_LIST_ENTRIES, |id| {
+            PluginId::parse(id).is_ok()
+        })?;
+        if self.dependencies.iter().any(|id| id == &self.id) {
+            return Err(field("dependencies", "a plugin cannot depend on itself"));
+        }
         Ok(())
     }
 }
@@ -196,33 +205,48 @@ fn list(
 
 /// `MAJOR.MINOR.PATCH` with optional `-pre` and `+build`. Enough of semver to reject junk; the
 /// host does the range comparison in JavaScript where the real semver library lives.
+/// Plain `MAJOR.MINOR.PATCH`, as the host's matcher understands it: no prerelease, no build
+/// metadata, no leading zeros.
+fn is_plain_version(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|b| b.is_ascii_digit())
+                && (part.len() == 1 || !part.starts_with('0'))
+        })
+}
+
 fn semver(name: &'static str, value: &str) -> Result<(), ManifestError> {
-    let core = value.split_once('+').map_or(value, |(core, _)| core);
-    let core = core.split_once('-').map_or(core, |(core, _)| core);
-    let parts: Vec<&str> = core.split('.').collect();
-    let ok = parts.len() == 3
-        && parts
-            .iter()
-            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()));
-    if ok {
+    if is_plain_version(value) {
         Ok(())
     } else {
-        Err(field(name, "must be semver MAJOR.MINOR.PATCH"))
+        Err(field(name, "must be MAJOR.MINOR.PATCH"))
     }
 }
 
-/// A semver range: `^1.2.0`, `~1.2`, `>=1.0.0 <2.0.0`, `1.x`, `*`. Checked for character set
-/// and length only; the host evaluates it.
+/// The range shapes the host's own matcher accepts, and nothing else: exact, `^`, `~`, and
+/// space-separated comparators (`>=0.2.0 <0.4.0`). No `||`, `x`, `*` or hyphen ranges. A range the
+/// bridge accepts but the host cannot evaluate would install a plugin that then never activates.
 fn semver_range(name: &'static str, value: &str) -> Result<(), ManifestError> {
-    let ok = (1..=64).contains(&value.len())
-        && value.chars().all(|c| {
-            c.is_ascii_alphanumeric()
-                || matches!(c, '^' | '~' | '>' | '<' | '=' | '.' | '-' | '|' | ' ' | '*')
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    let ok = !parts.is_empty()
+        && parts.len() <= 4
+        && parts.iter().all(|part| {
+            let version = part
+                .strip_prefix(">=")
+                .or_else(|| part.strip_prefix("<="))
+                .or_else(|| part.strip_prefix(['^', '~', '>', '<', '=']))
+                .unwrap_or(part);
+            is_plain_version(version)
         });
     if ok {
         Ok(())
     } else {
-        Err(field(name, "must be a semver range"))
+        Err(field(
+            name,
+            "must be a version range: exact, ^, ~ or comparators",
+        ))
     }
 }
 
@@ -277,7 +301,8 @@ mod tests {
             "optionalPermissions": ["network"],
             "actions": ["getFriends"],
             "events": ["friendOnline"],
-            "hosts": ["api.example.com"]
+            "hosts": ["api.example.com"],
+            "dependencies": ["presence-core"]
         })
     }
 
@@ -301,7 +326,7 @@ mod tests {
     #[test]
     fn only_the_required_fields_are_required() {
         let minimal = serde_json::json!({
-            "id": "ab", "name": "n", "version": "0.0.1", "apiVersion": "*", "description": "d"
+            "id": "ab", "name": "n", "version": "0.0.1", "apiVersion": "0.2.0", "description": "d"
         });
         assert!(parse(minimal).is_ok());
         for required in ["id", "name", "version", "apiVersion", "description"] {
@@ -332,6 +357,12 @@ mod tests {
             ("version", serde_json::json!("v1.2.3")),
             ("apiVersion", serde_json::json!("")),
             ("apiVersion", serde_json::json!("^0.2.0; rm")),
+            ("apiVersion", serde_json::json!("*")),
+            ("apiVersion", serde_json::json!(">=0.2.0 || <0.1.0")),
+            ("apiVersion", serde_json::json!("1.x")),
+            ("version", serde_json::json!("1.2.3-beta")),
+            ("dependencies", serde_json::json!(["Not-An-Id"])),
+            ("dependencies", serde_json::json!(["friend-alerts"])),
             ("description", serde_json::json!("x".repeat(201))),
             (
                 "tags",
@@ -357,9 +388,20 @@ mod tests {
     }
 
     #[test]
-    fn hosts_with_ports_and_prerelease_versions_are_fine() {
+    fn hosts_with_ports_and_every_accepted_range_shape_are_fine() {
         assert!(patched("hosts", serde_json::json!(["api.example.com:8443"])).is_ok());
-        assert!(patched("version", serde_json::json!("1.0.0-beta.1+build.5")).is_ok());
-        assert!(patched("apiVersion", serde_json::json!(">=0.2.0 <1.0.0 || 2.x")).is_ok());
+        for range in [
+            "0.2.0",
+            "=0.2.0",
+            "^0.2.0",
+            "~0.2.1",
+            ">=0.2.0 <1.0.0",
+            ">0.1.0 <=0.9.9",
+        ] {
+            assert!(
+                patched("apiVersion", serde_json::json!(range)).is_ok(),
+                "{range}"
+            );
+        }
     }
 }
