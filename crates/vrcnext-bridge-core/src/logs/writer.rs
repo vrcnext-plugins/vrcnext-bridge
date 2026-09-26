@@ -7,7 +7,7 @@ use crate::logs::proto::LogRecord;
 
 /// A sink for validated log records.
 ///
-/// Shared across the HTTP workers and every WebSocket thread behind an `Arc`, hence `Send + Sync`
+/// Shared across every HTTP handler and WebSocket session behind an `Arc`, hence `Send + Sync`
 /// and the `&self` receiver — an implementation owning a file handle locks it internally rather
 /// than forcing callers to serialise.
 pub trait LogWriter: Send + Sync {

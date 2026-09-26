@@ -1,280 +1,175 @@
-//! The inbound transport: a small threaded HTTP server over loopback.
+//! The inbound transport: an `axum` server over loopback, on a `tokio` runtime.
 //!
-//! HTTP because it is the only thing VRCNext's page can speak — `fetch` and nothing else. The
-//! server itself is deliberately dull; everything security-relevant lives in [`guard`], and
-//! everything capability-relevant lives behind [`ServiceRegistry`].
+//! HTTP and WebSockets are the only things VRCNext's page can speak. The server itself is
+//! deliberately dull; everything security-relevant lives in [`guard`], and everything
+//! capability-relevant lives behind [`ServiceRegistry`]. Services stay synchronous and run on the
+//! runtime's blocking pool, so a D-Bus round trip never stalls the sockets.
 
 pub(crate) mod guard;
 pub(crate) mod respond;
-pub(crate) mod route;
 pub(crate) mod ws;
 
-use std::io::Read as _;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
+use axum::Router;
+use axum::body::{Body, to_bytes};
+use axum::extract::{Path, State};
+use axum::http::HeaderMap;
+use axum::response::Response;
+use axum::routing::{get, post};
 use serde_json::Value;
-use tiny_http::{Header, Method, Request, Server};
+use vrcnext_bridge_core::envelope::is_name;
 use vrcnext_bridge_core::logs::LogWriter;
-use vrcnext_bridge_core::{ServiceRegistry, limits};
+use vrcnext_bridge_core::{ServiceError, ServiceRegistry, limits};
 
+use crate::broadcast::Broadcaster;
 use crate::config::Config;
-use guard::{Guard, Refusal};
-use respond::{cors_headers, reply, reply_json};
-use route::Route;
+use crate::startup::Wiring;
+use guard::{Guard, Refusal, refuse};
+use respond::{error, json};
 
-/// A running bridge.
-pub(crate) struct BridgeServer {
-    server: Arc<Server>,
-    guard: Arc<Guard>,
-    services: Arc<ServiceRegistry>,
-    log_writer: Arc<dyn LogWriter>,
-    threads: usize,
+/// Everything a handler can reach.
+pub(crate) struct AppState {
+    pub(crate) guard: Arc<Guard>,
+    pub(crate) services: Arc<ServiceRegistry>,
+    pub(crate) log_writer: Arc<dyn LogWriter>,
+    pub(crate) broadcaster: Broadcaster,
 }
 
-impl BridgeServer {
-    /// Bind the listener.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the address is already in use or cannot be bound.
-    pub(crate) fn bind(
-        config: &Config,
-        services: ServiceRegistry,
-        log_writer: Arc<dyn LogWriter>,
-    ) -> Result<Self> {
-        let server = Server::http(config.listen)
-            .map_err(|error| anyhow::anyhow!("{error}"))
-            .with_context(|| format!("failed to listen on {}", config.listen))?;
-
-        Ok(Self {
-            server: Arc::new(server),
-            guard: Arc::new(Guard::new(config)),
-            services: Arc::new(services),
-            log_writer,
-            threads: config.worker_threads(),
-        })
-    }
-
-    /// Serve until the process is stopped.
-    ///
-    /// Each worker owns a clone of the `Arc`s and pulls from the shared accept queue. Work per
-    /// request is short and I/O-bound, so a small fixed pool beats an async runtime here and keeps
-    /// the dependency surface — and the audit surface — smaller.
-    ///
-    /// # Errors
-    ///
-    /// Fails only if a worker thread cannot be spawned.
-    pub(crate) fn serve(&self) -> Result<()> {
-        std::thread::scope(|scope| {
-            for index in 0..self.threads {
-                let server = Arc::clone(&self.server);
-                let guard = Arc::clone(&self.guard);
-                let services = Arc::clone(&self.services);
-                let log_writer = Arc::clone(&self.log_writer);
-                std::thread::Builder::new()
-                    .name(format!("bridge-worker-{index}"))
-                    .spawn_scoped(scope, move || {
-                        worker(&server, &guard, &services, &log_writer);
-                    })
-                    .context("failed to spawn worker thread")?;
-            }
-            Ok(())
-        })
-    }
-}
-
-/// One worker's accept loop.
+/// Bind and serve until `SIGINT`.
 ///
-/// A panic while handling a request unwinds into [`std::panic::catch_unwind`] rather than taking
-/// the worker — and with it a share of the daemon's capacity — down with it. The lint set makes
-/// panics very unlikely; this is the backstop for the ones that are not.
-fn worker(
-    server: &Server,
-    guard: &Guard,
-    services: &ServiceRegistry,
-    log_writer: &Arc<dyn LogWriter>,
-) {
-    loop {
-        let request = match server.recv() {
-            Ok(request) => request,
-            Err(error) => {
-                log::error!("accept failed: {error}");
-                continue;
+/// # Errors
+///
+/// Fails if the address cannot be bound, or the server stops on an error.
+pub(crate) async fn serve(config: &Config, wiring: Wiring, broadcaster: Broadcaster) -> Result<()> {
+    let guard = Arc::new(Guard::new(config));
+    let state = Arc::new(AppState {
+        guard: Arc::clone(&guard),
+        services: Arc::new(wiring.services),
+        log_writer: wiring.log_writer,
+        broadcaster,
+    });
+
+    let app = Router::new()
+        .route("/v1/health", get(health))
+        .route("/v1/describe", get(describe))
+        .route("/v1/ws", get(ws::upgrade))
+        .route("/v1/{service}/{method}", post(call))
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
+        .layer(axum::middleware::from_fn_with_state(
+            guard,
+            guard::middleware,
+        ))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(config.listen)
+        .await
+        .with_context(|| format!("failed to listen on {}", config.listen))?;
+    log::info!("listening on http://{}", config.listen);
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                log::info!("shutting down");
             }
-        };
-
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle(request, guard, services, log_writer);
-        }));
-        if outcome.is_err() {
-            log::error!("a request handler panicked; the worker is continuing");
-        }
-    }
+        })
+        .await
+        .context("server stopped")
 }
 
-/// Route, guard, dispatch, respond.
-fn handle(
-    request: Request,
-    guard: &Guard,
-    services: &ServiceRegistry,
-    log_writer: &Arc<dyn LogWriter>,
-) {
-    // An access log, at debug. Without it a working request is indistinguishable from one that
-    // never arrived, which makes "is the page actually reaching me?" unanswerable — the first
-    // question anyone debugging this will have. Only the method and path are logged: the path
-    // carries no caller content, and the body may carry notification text.
-    log::debug!("{} {}", request.method(), request.url());
-
-    // An upgrade is not a normal request: it has no body, answers 101, and CORS plays no part in
-    // protecting it. Route it before any of that machinery runs.
-    if Route::parse(request.url()) == Route::LogStream {
-        ws::serve_log_stream(request, guard, Arc::clone(log_writer));
-        return;
-    }
-
-    let cors = cors_headers(
-        guard::header(&request, "origin")
-            .filter(|origin| guard.origins().allows(origin))
-            .as_deref(),
-    );
-
-    if let Err(refusal) = guard
-        .check_rate()
-        .and_then(|()| guard.check_admission(&request))
-    {
-        reply_json(
-            request,
-            refusal.status(),
-            &refusal_body(&refusal),
-            &with_retry_after(cors, &refusal),
-        );
-        return;
-    }
-
-    // The preflight. Answering it is what lets the browser send the real request; refusing it,
-    // for an origin that is not allow-listed, is what stops a random web page reaching the bridge.
-    if *request.method() == Method::Options {
-        reply(request, 204, "", &cors);
-        return;
-    }
-
-    match (request.method().clone(), Route::parse(request.url())) {
-        (Method::Get, Route::Health) => {
-            reply_json(request, 200, &health_body(services), &cors);
-        }
-        (Method::Get, Route::Describe) => {
-            let body =
-                serde_json::json!({ "version": crate::VERSION, "services": services.describe() });
-            reply_json(request, 200, &body, &cors);
-        }
-        (Method::Post, Route::Call { service, method }) => {
-            dispatch(request, services, &service, &method, &cors);
-        }
-        (_, Route::NotFound) => {
-            reply_json(
-                request,
-                404,
-                &error_body("not_found", "no such endpoint"),
-                &cors,
-            );
-        }
-        _ => {
-            let body = error_body("method_not_allowed", "wrong HTTP method for this endpoint");
-            reply_json(request, 405, &body, &cors);
-        }
-    }
+async fn health(State(state): State<Arc<AppState>>) -> Response {
+    json(
+        200,
+        &serde_json::json!({
+            "ok": true,
+            "version": crate::VERSION,
+            "services": state.services.services().map(|service| service.name()).collect::<Vec<_>>(),
+        }),
+    )
 }
 
-/// Read the body under the size cap and hand it to a service.
-fn dispatch(
-    mut request: Request,
-    services: &ServiceRegistry,
-    service: &str,
-    method: &str,
-    cors: &[Header],
-) {
-    if let Err(refusal) = Guard::check_body(&request, limits::MAX_BODY_BYTES) {
-        reply_json(request, refusal.status(), &refusal_body(&refusal), cors);
-        return;
-    }
+async fn describe(State(state): State<Arc<AppState>>) -> Response {
+    json(
+        200,
+        &serde_json::json!({
+            "version": crate::VERSION,
+            "socket": "/v1/ws",
+            "services": state.services.describe(),
+        }),
+    )
+}
 
-    let params = match read_params(&mut request) {
+async fn not_found() -> Response {
+    error(404, "not_found", "no such endpoint")
+}
+
+async fn method_not_allowed() -> Response {
+    error(
+        405,
+        "method_not_allowed",
+        "wrong HTTP method for this endpoint",
+    )
+}
+
+/// `POST /v1/<service>/<method>` — one call, for `curl` and anything else that is not the page.
+async fn call(
+    State(state): State<Arc<AppState>>,
+    Path((service, method)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if !is_name(&service) || !is_name(&method) {
+        return not_found().await;
+    }
+    if let Err(refusal) = Guard::check_body(&headers, limits::MAX_BODY_BYTES) {
+        return refuse(&refusal);
+    }
+    let params = match read_params(body).await {
         Ok(params) => params,
-        Err((status, body)) => {
-            reply_json(request, status, &body, cors);
-            return;
-        }
+        Err(response) => return response,
     };
 
-    match services.call(service, method, params) {
-        Ok(value) => reply_json(request, 200, &value, cors),
-        Err(error) => {
-            let body = error_body(error.code(), &error.to_string());
-            reply_json(request, error.status(), &body, cors);
-        }
+    match dispatch(&state.services, service, method, params).await {
+        Ok(value) => json(200, &value),
+        Err(failure) => error(failure.status(), failure.code(), &failure.to_string()),
     }
 }
 
-/// Read and parse the request body, or produce the response that should be sent instead.
-fn read_params(request: &mut Request) -> Result<Value, (u16, Value)> {
-    let body = read_body(request, limits::MAX_BODY_BYTES)
-        .map_err(|refusal| (refusal.status(), refusal_body(&refusal)))?;
+/// Run a service call on the blocking pool.
+///
+/// A panic inside a service is caught by the pool and reported as an internal error: it costs
+/// that one request, never the daemon. The lint set makes panics very unlikely; this is the
+/// backstop for the ones that are not.
+pub(crate) async fn dispatch(
+    services: &Arc<ServiceRegistry>,
+    service: String,
+    method: String,
+    params: Value,
+) -> Result<Value, ServiceError> {
+    let services = Arc::clone(services);
+    tokio::task::spawn_blocking(move || services.call(&service, &method, params))
+        .await
+        .unwrap_or_else(|join_error| {
+            log::error!("a service call panicked: {join_error}");
+            Err(ServiceError::Internal("the service failed".to_owned()))
+        })
+}
 
-    if body.trim().is_empty() {
+/// Read the body under the size cap and parse it, or produce the response to send instead.
+///
+/// `to_bytes` bounds the read independently of `Content-Length`, so a caller that lies about its
+/// length — or sends none at all — still cannot push unbounded bytes into memory.
+async fn read_params(body: Body) -> Result<Value, Response> {
+    let bytes = to_bytes(body, limits::MAX_BODY_BYTES)
+        .await
+        .map_err(|_| refuse(&Refusal::PayloadTooLarge))?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| refuse(&Refusal::MalformedBody))?;
+
+    if text.trim().is_empty() {
         return Ok(Value::Object(serde_json::Map::new()));
     }
-    serde_json::from_str(&body).map_err(|error| {
-        (
-            400,
-            error_body("bad_request", &format!("invalid JSON: {error}")),
-        )
-    })
-}
-
-/// Read at most `max` bytes, refusing rather than truncating.
-///
-/// `Read::take` bounds this independently of the `Content-Length` header, so a caller that lies
-/// about its length — or sends none at all — still cannot push unbounded bytes into memory.
-fn with_retry_after(mut headers: Vec<Header>, refusal: &Refusal) -> Vec<Header> {
-    if let Refusal::RateLimited(after) = refusal {
-        let seconds = after.as_secs().max(1).to_string();
-        if let Some(header) = guard::make_header("Retry-After", &seconds) {
-            headers.push(header);
-        }
-    }
-    headers
-}
-
-fn read_body(request: &mut Request, max: usize) -> Result<String, Refusal> {
-    let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
-    let mut buffer = Vec::new();
-    if request
-        .as_reader()
-        .take(limit)
-        .read_to_end(&mut buffer)
-        .is_err()
-    {
-        return Err(Refusal::PayloadTooLarge);
-    }
-    if buffer.len() > max {
-        return Err(Refusal::PayloadTooLarge);
-    }
-    String::from_utf8(buffer).map_err(|_| Refusal::MalformedBody)
-}
-
-fn health_body(services: &ServiceRegistry) -> Value {
-    serde_json::json!({
-        "ok": true,
-        "version": crate::VERSION,
-        "services": services.services().map(|service| service.name()).collect::<Vec<_>>(),
-    })
-}
-
-fn error_body(code: &str, message: &str) -> Value {
-    serde_json::json!({ "ok": false, "error": { "code": code, "message": message } })
-}
-
-fn refusal_body(refusal: &Refusal) -> Value {
-    error_body(refusal.code(), refusal.message())
+    serde_json::from_str(text)
+        .map_err(|parse_error| error(400, "bad_request", &format!("invalid JSON: {parse_error}")))
 }

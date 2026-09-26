@@ -21,9 +21,9 @@ env_logger = { version = "0.11", default-features = false, features = ["humantim
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tiny_http = "0.12"
-# Protocol only — no TLS features, so this stays pure Rust and loopback-only.
-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# Transport. No TLS anywhere: the bridge is loopback-only and stays pure Rust.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 
 [workspace.lints.rust]

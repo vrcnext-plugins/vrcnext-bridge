@@ -12,8 +12,12 @@
 //! exposes named methods:
 //!
 //! ```text
-//! POST /v1/<service>/<method>
+//! POST /v1/<service>/<method>                          one call, over HTTP
+//! WS   /v1/ws   {"type":"request","id":…,"service":…}  many calls, over one socket
 //! ```
+//!
+//! The socket is the transport the plugin system uses; HTTP exists for the upgrade handshake, a
+//! health probe, and anyone with `curl`. Both reach the same [`ServiceRegistry`].
 //!
 //! Notifications are simply the first service. A future OSC service, clipboard service or
 //! process-presence service slots in beside it by implementing [`Service`] and registering — no
@@ -37,12 +41,14 @@
 //! `vrcnext-bridge-sinks`, which keeps validation, dispatch and rate limiting testable without a
 //! D-Bus session, a VR runtime or a listening socket.
 
+pub mod envelope;
 pub mod limits;
 pub mod logs;
 pub mod notify;
 pub mod ratelimit;
 pub mod service;
 
+pub use envelope::{ClientMessage, EnvelopeError, Inbound, Request, ServerMessage};
 pub use logs::{LogLevel, LogRecord, LogService, LogWriter, NullLogWriter};
 pub use notify::{
     Notification, NotifyRequest, NotifyService, Sink, SinkError, SinkHealth, Urgency,

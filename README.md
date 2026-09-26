@@ -3,24 +3,49 @@
 An optional, loopback-only companion daemon for
 [the VRCNext plugin system](https://github.com/vrcnext-plugins/vrcnext-plugin-system).
 
-VRCNext's page can only speak HTTP. It cannot open a UDP socket, connect to D-Bus, or reach a unix
-socket — so anything a plugin wants that needs one of those has to happen in a native process.
-This is that process.
+VRCNext's page can only speak HTTP and WebSockets. It cannot open a UDP socket, connect to D-Bus,
+or reach a unix socket — so anything a plugin wants that needs one of those has to happen in a
+native process. This is that process.
 
 ```
-plugin  ──fetch──▶  vrcnext-bridge  ──UDP──────▶  WayVR / XSOverlay-protocol overlay
-                          │
-                          └────────D-Bus──────▶  the desktop's notification daemon
+plugin  ──WebSocket──▶  vrcnext-bridge  ──UDP──────▶  WayVR / XSOverlay-protocol overlay
+                              │
+                              └────────D-Bus──────▶  the desktop's notification daemon
 ```
 
-**It is not a notification daemon.** It is a registry of *services*, each with named methods:
+**It is not a notification daemon.** It is a registry of *services*, each with named methods,
+reachable two ways:
 
 ```
-POST /v1/<service>/<method>
+WS   /v1/ws                     one persistent socket — what the plugin system uses
+POST /v1/<service>/<method>     one call — for curl and anything else that is not the page
 ```
 
 `notify` is the first service. A future OSC, clipboard or presence service registers beside it
 without touching the transport, the request guard, the rate limiter, or the wiring.
+
+## The socket
+
+The plugin system opens `/v1/ws` once and keeps it open. Every frame is JSON with a `type`:
+
+```jsonc
+// page → bridge: a call, answered under the same id. Several may be in flight.
+{ "type": "request", "id": "17", "service": "notify", "method": "send", "params": { "title": "Hi" } }
+// bridge → page
+{ "type": "response", "id": "17", "ok": true, "result": { "delivered": ["wayvr"], "failed": [] } }
+{ "type": "response", "id": "17", "ok": false, "error": { "code": "bad_request", "message": "…" } }
+
+// page → bridge: a batch of plugin log lines for the log file. Never answered.
+{ "type": "logs", "records": [{ "level": "info", "scope": "my-plugin", "message": "…", "ts": 0 }] }
+
+// bridge → page: the daemon's own log lines, and protocol errors that had no id to answer under.
+{ "type": "push", "event": "log", "data": { "level": "warn", "scope": "bridge", "message": "…", "ts": 0 } }
+{ "type": "push", "event": "error", "data": { "code": "bad_request", "message": "…" } }
+```
+
+`id` is caller-chosen, up to 128 characters. Service and method names are lowercase identifiers
+of up to 64 characters. A request over the socket draws from the same rate-limit bucket as an HTTP
+call, so switching transports buys nothing; log frames have their own, far larger, budget.
 
 ## Targeting
 
@@ -83,14 +108,17 @@ Honest accounting, because this was reverse-engineered rather than read from a s
 
 | Method | Path | Purpose |
 | :--- | :--- | :--- |
-| `GET` | `/v1/health` | liveness, version, service names |
+| `GET` | `/v1/health` | liveness, version, service names — how the plugin system tells "running" from "not installed" |
 | `GET` | `/v1/describe` | every service, method and target, with health |
+| `GET` | `/v1/ws` | the WebSocket upgrade |
 | `POST` | `/v1/notify/send` | deliver a notification |
 | `POST` | `/v1/notify/targets` | targets and the fields each honours |
+| `POST` | `/v1/logs/write` | append a batch of plugin log lines to the log file |
+| `POST` | `/v1/logs/info` | where that file is and how big it has grown |
 
 ## Security
 
-A localhost HTTP daemon has three classes of caller, and only one of them matters.
+A localhost daemon has three classes of caller, and only one of them matters.
 
 1. **The VRCNext page.** The intended one.
 2. **Other processes running as this user.** They already have the user's privileges and could call
@@ -108,6 +136,10 @@ What is done about it:
   the CORS simple-request list, so browsers must preflight — and the preflight is refused for
   origins that are not allow-listed. `Access-Control-Allow-Origin` is never `*` and never reflects
   an arbitrary origin.
+- **The WebSocket checks `Origin` itself.** CORS does not protect an upgrade: a browser completes
+  a `ws://127.0.0.1` handshake from any page, with no preflight. The same origin allowlist and
+  bearer check therefore run in front of the upgrade, and a bad origin is answered 403 before a
+  frame is read.
 - **Loopback only, with no override flag.** `--listen` refuses a non-loopback address. There is
   deliberately no way to force it; such a flag would exist only to be misused.
 - **No sink may ever execute a program, open a shell, or write to a caller-chosen path.** This is
@@ -168,7 +200,7 @@ build, in that order, with nothing filtered.
 | :--- | :--- |
 | `vrcnext-bridge-core` | protocol, validation, `Service` and `Sink` traits, dispatch, rate limiter. **No I/O**, so it tests without a bus or a socket. |
 | `vrcnext-bridge-sinks` | the concrete `wayvr` and `freedesktop` sinks. |
-| `vrcnext-bridge` | the binary: HTTP transport, request guard, configuration, wiring. |
+| `vrcnext-bridge` | the binary: the `tokio`/`axum` transport, the WebSocket session, the request guard, configuration, wiring. |
 
 ## Licence
 

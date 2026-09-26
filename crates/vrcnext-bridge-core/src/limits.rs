@@ -24,6 +24,13 @@ pub const MAX_ICON_CHARS: usize = 128 * 1024;
 /// Longest `audio_path` value.
 pub const MAX_AUDIO_PATH_CHARS: usize = 512;
 
+/// Longest service or method name, so an unknown-name error cannot echo a huge string.
+pub const MAX_NAME_CHARS: usize = 64;
+
+/// Longest WebSocket correlation id. It is echoed back verbatim, so it is bounded like any other
+/// caller-supplied string that ends up in a response.
+pub const MAX_CORRELATION_ID_CHARS: usize = 128;
+
 /// Most sinks one request may name.
 pub const MAX_REQUESTED_SINKS: usize = 8;
 

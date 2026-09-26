@@ -54,16 +54,18 @@ curl -s http://127.0.0.1:42081/v1/health
 | `--sink` | all of them | Repeat to enable a subset, e.g. `--sink wayvr`. |
 | `--wayvr-addr` | `127.0.0.1:42069` | Where the XSOverlay-protocol listener is. |
 | `--token` | none | Bearer token, 16+ characters. Worth setting on a shared machine. |
-| `--rate` / `--burst` | `5` / `10` | Token bucket. |
+| `--rate` / `--burst` | `5` / `10` | Token bucket, shared by HTTP calls and socket requests. |
+| `--threads` | `4` | Runtime worker threads. Services run on a separate blocking pool. |
 | `--log` | `info` | `debug` logs every delivery. |
 
 Each also reads an environment variable — see `vrcnext-bridge --help`.
 
 ## Telling the plugin system where it is
 
-The host looks at `http://127.0.0.1:42081` and probes once at boot. **Plugins → Plugin System**
-shows whether it connected, which targets exist, and has a **Re-check** button for after you have
-just started it.
+The host looks at `http://127.0.0.1:42081`, probes `/v1/health` at boot, and keeps a WebSocket to
+`/v1/ws` open for as long as VRCNext runs, reconnecting in the background if the daemon goes away.
+**Plugins → Plugin System** shows one of three states — not detected, running but not connected,
+connected — lists the targets, and has a **Re-check** button for after you have just started it.
 
 ## Troubleshooting
 

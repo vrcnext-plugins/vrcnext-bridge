@@ -27,12 +27,25 @@
 //!
 //! A request with **no** `Origin` header is allowed: that is a native caller (curl, a script, a
 //! future non-browser client), which is class (2) and gains nothing by being here.
+//!
+//! # WebSockets are not protected by CORS
+//!
+//! A browser will complete a `ws://127.0.0.1` handshake from any page, with no preflight and no
+//! `Access-Control-Allow-Origin` to withhold. What it *does* send is an `Origin` header, and
+//! checking it server-side is the only defence. The guard therefore runs as middleware in front of
+//! every route, the upgrade included: an upgrade from an origin that is not allow-listed is
+//! answered 403 before a single frame is read.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use tiny_http::{Header, Request};
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::middleware::Next;
+use axum::response::{IntoResponse as _, Response};
 use vrcnext_bridge_core::RateLimiter;
 
+use super::respond::{add_header, cors_headers, error};
 use crate::config::Config;
 
 /// Why a request was refused before it reached a service.
@@ -167,12 +180,6 @@ impl Guard {
         }
     }
 
-    /// The origin policy, for building CORS response headers.
-    #[must_use]
-    pub(crate) const fn origins(&self) -> &OriginPolicy {
-        &self.origins
-    }
-
     /// Take a rate-limit token.
     ///
     /// Applies to **every** request, not just the ones that deliver something. `/v1/health` is
@@ -195,18 +202,18 @@ impl Guard {
     /// # Errors
     ///
     /// Returns the first [`Refusal`] that applies.
-    pub(crate) fn check_admission(&self, request: &Request) -> Result<(), Refusal> {
-        if let Some(origin) = header(request, "origin") {
-            if !self.origins.allows(&origin) {
+    pub(crate) fn check_admission(&self, headers: &HeaderMap) -> Result<(), Refusal> {
+        if let Some(origin) = header(headers, header::ORIGIN) {
+            if !self.origins.allows(origin) {
                 log::warn!("refused request from origin {}", origin.escape_debug());
                 return Err(Refusal::ForbiddenOrigin);
             }
         }
 
         if let Some(expected) = &self.token {
-            let presented = header(request, "authorization")
-                .and_then(|value| value.strip_prefix("Bearer ").map(str::to_owned));
-            if !presented.is_some_and(|token| constant_time_eq(&token, expected)) {
+            let presented = header(headers, header::AUTHORIZATION)
+                .and_then(|value| value.strip_prefix("Bearer "));
+            if !presented.is_some_and(|token| constant_time_eq(token, expected)) {
                 return Err(Refusal::Unauthorized);
             }
         }
@@ -221,8 +228,8 @@ impl Guard {
     /// browsers to preflight — or [`Refusal::PayloadTooLarge`] if the declared length is over the
     /// limit. Rate limiting is handled separately by [`Guard::check_rate`], which covers every
     /// request rather than only those with a body.
-    pub(crate) fn check_body(request: &Request, max_bytes: usize) -> Result<(), Refusal> {
-        let content_type = header(request, "content-type").unwrap_or_default();
+    pub(crate) fn check_body(headers: &HeaderMap, max_bytes: usize) -> Result<(), Refusal> {
+        let content_type = header(headers, header::CONTENT_TYPE).unwrap_or_default();
         let base = content_type
             .split(';')
             .next()
@@ -233,31 +240,70 @@ impl Guard {
             return Err(Refusal::UnsupportedMediaType);
         }
 
-        if request
-            .body_length()
-            .is_some_and(|declared| declared > max_bytes)
-        {
+        let declared =
+            header(headers, header::CONTENT_LENGTH).and_then(|v| v.parse::<usize>().ok());
+        if declared.is_some_and(|declared| declared > max_bytes) {
             return Err(Refusal::PayloadTooLarge);
         }
         Ok(())
     }
+
+    /// The `Origin` this request may be answered for, if it sent one that passes the policy.
+    fn allowed_origin<'h>(&self, headers: &'h HeaderMap) -> Option<&'h str> {
+        header(headers, header::ORIGIN).filter(|origin| self.origins.allows(origin))
+    }
 }
 
-/// Case-insensitive header lookup.
+/// The middleware in front of every route: rate limit, admission, preflight, CORS headers.
 ///
-/// `name` is `&'static str` because `HeaderField::equiv` requires it — which is fine, since every
-/// header this daemon looks for is a literal.
-pub(crate) fn header(request: &Request, name: &'static str) -> Option<String> {
-    request
-        .headers()
-        .iter()
-        .find(|header| header.field.equiv(name))
-        .map(|header| header.value.as_str().to_owned())
+/// Order matters. The rate limit comes first so that a refused origin hammering the daemon still
+/// costs it tokens; admission second so a preflight from a bad origin is refused rather than
+/// answered; and the preflight answer third, so only an allow-listed origin ever gets its 204.
+pub(crate) async fn middleware(
+    State(guard): State<Arc<Guard>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    // An access log, at debug. Without it a working request is indistinguishable from one that
+    // never arrived, which makes "is the page actually reaching me?" unanswerable — the first
+    // question anyone debugging this will have. Only the method and path are logged: the path
+    // carries no caller content, and the body may carry notification text.
+    log::debug!("{} {}", request.method(), request.uri().path());
+
+    let cors = cors_headers(guard.allowed_origin(request.headers()));
+
+    let mut response = match guard
+        .check_rate()
+        .and_then(|()| guard.check_admission(request.headers()))
+    {
+        Err(refusal) => refuse(&refusal),
+        // The preflight. Answering it is what lets the browser send the real request; refusing
+        // it, for an origin that is not allow-listed, is what stops a random page reaching us.
+        Ok(()) if request.method() == Method::OPTIONS => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => next.run(request).await,
+    };
+
+    response.headers_mut().extend(cors);
+    response
 }
 
-/// Build a header, discarding malformed ones rather than panicking.
-pub(crate) fn make_header(name: &str, value: &str) -> Option<Header> {
-    Header::from_bytes(name.as_bytes(), value.as_bytes()).ok()
+/// The response for a refusal, with `Retry-After` when the caller should wait.
+#[must_use]
+pub(crate) fn refuse(refusal: &Refusal) -> Response {
+    let mut response = error(refusal.status(), refusal.code(), refusal.message());
+    if let Refusal::RateLimited(after) = refusal {
+        add_header(
+            &mut response,
+            header::RETRY_AFTER,
+            &after.as_secs().max(1).to_string(),
+        );
+    }
+    response
+}
+
+/// A header's value as text, or `None` if absent or not UTF-8.
+fn header(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
 }
 
 /// Compare two secrets without leaking their common prefix through timing.

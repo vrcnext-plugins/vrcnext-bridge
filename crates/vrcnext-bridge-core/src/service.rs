@@ -1,6 +1,6 @@
 //! The bridge's extension point: a named capability with named methods.
 //!
-//! Everything the bridge can do for a plugin is a [`Service`]. The HTTP layer knows how to
+//! Everything the bridge can do for a plugin is a [`Service`]. The transport knows how to
 //! authenticate a request, bound its size, rate-limit it and route it to
 //! `<service>/<method>` — and nothing else. It has no notion of notifications, overlays or
 //! sockets. Adding a capability is implementing this trait and calling

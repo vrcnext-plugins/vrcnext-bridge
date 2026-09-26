@@ -1,23 +1,23 @@
-//! Broadcasts internal daemon log events to active WebSocket connections.
+//! Fan the daemon's own log lines out to every open WebSocket.
 //!
-//! When connected, the VRCNext plugin system streams plugin log records to the bridge, and
-//! the bridge broadcasts its own diagnostic logs back over the WebSocket.
+//! The page mirrors its logs to the bridge; the bridge mirrors its logs back. Someone debugging a
+//! notification that never arrived then sees both halves of the conversation in one place — the
+//! in-app Logs panel — without a terminal.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::{Mutex, OnceLock};
-
-use vrcnext_bridge_core::logs::LogLevel;
-
-/// Maximum queued broadcast messages per WebSocket subscriber before dropping old records.
-const SUBSCRIBER_QUEUE_BOUND: usize = 256;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use tokio::sync::broadcast;
+use vrcnext_bridge_core::logs::LogLevel;
 
-/// Global broadcaster instance.
-static BROADCASTER: OnceLock<LogBroadcaster> = OnceLock::new();
+/// Records a subscriber may fall behind by before it starts losing the oldest.
+///
+/// A subscriber only falls behind if its socket is not draining, and a socket that is not
+/// draining is one the page is not reading; losing its oldest daemon log lines is the right
+/// thing to lose.
+const CHANNEL_CAPACITY: usize = 256;
 
-/// A formatted log message ready to be serialized to WebSocket subscribers.
+/// One daemon log line, shaped like the records the page sends so the page can store it as one.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BroadcastRecord {
@@ -27,83 +27,40 @@ pub(crate) struct BroadcastRecord {
     pub(crate) ts: f64,
 }
 
-struct Subscriber {
-    id: usize,
-    sender: SyncSender<BroadcastRecord>,
+/// A handle any socket can subscribe through.
+#[derive(Clone)]
+pub(crate) struct Broadcaster {
+    sender: broadcast::Sender<BroadcastRecord>,
 }
 
-/// Dispatches log records to registered subscribers.
-pub(crate) struct LogBroadcaster {
-    subscribers: Mutex<Vec<Subscriber>>,
-    next_id: AtomicUsize,
-}
-
-impl LogBroadcaster {
-    /// Get or initialise the global broadcaster.
-    pub(crate) fn global() -> &'static Self {
-        BROADCASTER.get_or_init(|| Self {
-            subscribers: Mutex::new(Vec::new()),
-            next_id: AtomicUsize::new(1),
-        })
-    }
-
-    /// Register a new WebSocket subscriber channel.
-    pub(crate) fn subscribe(&self) -> (usize, Receiver<BroadcastRecord>) {
-        let (sender, receiver) = sync_channel(SUBSCRIBER_QUEUE_BOUND);
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut subs) = self.subscribers.lock() {
-            subs.push(Subscriber { id, sender });
-        }
-        (id, receiver)
-    }
-
-    /// Unregister a subscriber by id.
-    pub(crate) fn unsubscribe(&self, id: usize) {
-        if let Ok(mut subs) = self.subscribers.lock() {
-            subs.retain(|sub| sub.id != id);
-        }
-    }
-
-    /// Broadcast a log record to all subscribers without blocking.
-    pub(crate) fn broadcast(&self, record: &BroadcastRecord) {
-        if let Ok(mut subs) = self.subscribers.lock() {
-            subs.retain(|sub| {
-                // Non-blocking send: if the buffer is full, drop rather than blocking daemon execution.
-                match sub.sender.try_send(record.clone()) {
-                    Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => true,
-                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
-                }
-            });
-        }
+impl Broadcaster {
+    /// Start receiving every record logged from now on.
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<BroadcastRecord> {
+        self.sender.subscribe()
     }
 }
 
-/// A custom `log::Log` implementation that forwards to `env_logger` and broadcasts to active WebSockets.
+/// The global `log` handler: writes through `env_logger`, and broadcasts a copy.
 pub(crate) struct BroadcastLogger {
     inner: env_logger::Logger,
-    broadcaster: &'static LogBroadcaster,
+    sender: broadcast::Sender<BroadcastRecord>,
 }
 
 impl BroadcastLogger {
-    /// Wrap an initialized `env_logger::Logger` with broadcasting.
-    #[must_use]
-    pub(crate) fn new(inner: env_logger::Logger) -> Self {
-        Self {
-            inner,
-            broadcaster: LogBroadcaster::global(),
-        }
-    }
-
-    /// Install this logger as the global `log` handler.
+    /// Install as the global logger and hand back the subscription handle.
     ///
     /// # Errors
     ///
-    /// Returns an error if a logger was already installed.
-    pub(crate) fn init(self) -> Result<(), log::SetLoggerError> {
-        let max_level = self.inner.filter();
-        log::set_boxed_logger(Box::new(self))?;
+    /// Fails if a logger was already installed.
+    pub(crate) fn install(inner: env_logger::Logger) -> Result<Broadcaster, log::SetLoggerError> {
+        let (sender, _) = broadcast::channel(CHANNEL_CAPACITY);
+        let max_level = inner.filter();
+        log::set_boxed_logger(Box::new(Self {
+            inner,
+            sender: sender.clone(),
+        }))?;
         log::set_max_level(max_level);
-        Ok(())
+        Ok(Broadcaster { sender })
     }
 }
 
@@ -113,27 +70,28 @@ impl log::Log for BroadcastLogger {
     }
 
     fn log(&self, record: &log::Record) {
-        if self.inner.enabled(record.metadata()) {
-            self.inner.log(record);
-
-            let level = match record.level() {
-                log::Level::Error => LogLevel::Error,
-                log::Level::Warn => LogLevel::Warn,
-                log::Level::Info => LogLevel::Info,
-                log::Level::Debug | log::Level::Trace => LogLevel::Debug,
-            };
-
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0.0, |d| d.as_secs_f64() * 1000.0);
-
-            self.broadcaster.broadcast(&BroadcastRecord {
-                level,
-                scope: "bridge",
-                message: format!("{}", record.args()),
-                ts: now_ms,
-            });
+        if !self.inner.enabled(record.metadata()) {
+            return;
         }
+        self.inner.log(record);
+
+        let level = match record.level() {
+            log::Level::Error => LogLevel::Error,
+            log::Level::Warn => LogLevel::Warn,
+            log::Level::Info => LogLevel::Info,
+            log::Level::Debug | log::Level::Trace => LogLevel::Debug,
+        };
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64() * 1000.0);
+
+        // `send` only fails when nobody is subscribed, which is the normal state.
+        let _ = self.sender.send(BroadcastRecord {
+            level,
+            scope: "bridge",
+            message: record.args().to_string(),
+            ts,
+        });
     }
 
     fn flush(&self) {

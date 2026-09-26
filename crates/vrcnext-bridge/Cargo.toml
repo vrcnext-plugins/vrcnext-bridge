@@ -18,8 +18,8 @@ env_logger.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tiny_http.workspace = true
-tungstenite.workspace = true
+axum.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

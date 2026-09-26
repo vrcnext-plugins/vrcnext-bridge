@@ -1,199 +1,215 @@
-//! The `/v1/logs/stream` WebSocket.
+//! `/v1/ws` — the one socket the page keeps open.
 //!
-//! # WebSockets are not protected by CORS
+//! Everything the plugin system does with the bridge goes over this: service calls, correlated by
+//! id so several can be in flight; log batches from the page, fire-and-forget; and the daemon's
+//! own log lines pushed back the other way. The envelope is defined in
+//! [`vrcnext_bridge_core::envelope`].
 //!
-//! This is the security point that matters here, and it is easy to get wrong. Every other endpoint
-//! on this daemon is shielded by forcing a CORS preflight the browser will refuse for a
-//! non-loopback origin. **That mechanism does not exist for WebSockets.** A browser will happily
-//! complete a `ws://127.0.0.1` handshake from any page, and the page can then send whatever it
-//! likes; there is no preflight and no `Access-Control-Allow-Origin` to withhold.
+//! # Admission
 //!
-//! What a browser *does* send is an `Origin` header, and checking it server-side is the only
-//! defence. So the upgrade runs the same [`Guard`] admission check as everything else — origin
-//! allowlist and bearer token — before a single frame is read. A handshake that fails it is
-//! answered with 403 and the socket is dropped.
+//! The [`super::guard`] middleware has already run by the time the upgrade reaches this module,
+//! so an origin that is not allow-listed never gets here. See the guard for why that is the only
+//! defence a WebSocket has.
 //!
-//! The endpoint is also **write-only**: it accepts log records and sends nothing back but an
-//! occasional acknowledgement. It never serves file contents.
+//! # Shape of the session
 //!
-//! # Threading
-//!
-//! [`tiny_http`] hands requests to a small fixed worker pool. A WebSocket lives for as long as the
-//! page is open, so handling it on the worker that accepted it would retire that worker for the
-//! session — four connections would starve the HTTP endpoints completely. The upgraded socket is
-//! therefore moved to its own thread and the worker returns to the pool immediately.
+//! One task per socket, `select!`ing over three things: frames from the peer, responses coming
+//! back from service calls, and the daemon's log broadcast. Nothing blocks in that loop — service
+//! calls are spawned onto the blocking pool and answer through a channel — so a slow D-Bus call
+//! neither delays a quick one nor stops log lines flowing.
 
 use std::sync::Arc;
 
-use tiny_http::{Request, Response};
-use tungstenite::protocol::{Role, WebSocketConfig};
-use tungstenite::{Message, WebSocket};
+use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::response::Response;
+use tokio::sync::{broadcast, mpsc};
 use vrcnext_bridge_core::RateLimiter;
-use vrcnext_bridge_core::logs::{LogWriteRequest, LogWriter};
+use vrcnext_bridge_core::envelope::{ClientMessage, Inbound, Request, ServerMessage};
+use vrcnext_bridge_core::logs::{LogRecordIn, LogWriteRequest, LogWriter};
 
-use super::guard::{self, Guard};
+use super::AppState;
 
 /// Largest frame accepted. A batch of 200 records at 4000 characters each cannot exceed this.
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
-/// Frames per second one connection may send before it is closed.
+/// Log frames per second one connection may send before it is closed.
 ///
-/// Separate from the HTTP rate limiter: a log stream is expected to be chatty, but a runaway loop
-/// writing to a file on the user's disk still has to be stopped.
-const FRAMES_PER_SECOND: f64 = 200.0;
-const FRAME_BURST: u32 = 400;
+/// Separate from the request rate limiter: a log stream is expected to be chatty, but a runaway
+/// loop writing to a file on the user's disk still has to be stopped.
+const LOG_FRAMES_PER_SECOND: f64 = 200.0;
+const LOG_FRAME_BURST: u32 = 400;
 
-/// Take over `request` as a WebSocket, or answer with an error.
-///
-/// Consumes the request either way, so the caller must not respond again.
-pub(crate) fn serve_log_stream(request: Request, guard: &Guard, writer: Arc<dyn LogWriter>) {
-    if let Err(refusal) = guard.check_admission(&request) {
-        log::warn!("refused a log-stream upgrade: {}", refusal.code());
-        let response = Response::from_string(refusal.message()).with_status_code(refusal.status());
-        if let Err(error) = request.respond(response) {
-            log::debug!("could not answer a refused upgrade: {error}");
-        }
-        return;
-    }
+/// Responses waiting to be written. Backpressure on the calls, not a drop.
+const RESPONSE_QUEUE: usize = 64;
 
-    let Some(key) = guard::header(&request, "sec-websocket-key") else {
-        respond_plain(request, 400, "missing Sec-WebSocket-Key");
-        return;
+/// Upgrade and hand the socket to [`session`].
+pub(crate) async fn upgrade(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
+    ws.max_message_size(MAX_FRAME_BYTES)
+        .on_upgrade(move |socket| session(socket, state))
+}
+
+/// Everything one connection needs, so the frame handlers have one parameter.
+struct Session {
+    state: Arc<AppState>,
+    log_limiter: RateLimiter,
+    replies: mpsc::Sender<ServerMessage>,
+    written: u64,
+}
+
+async fn session(mut socket: WebSocket, state: Arc<AppState>) {
+    log::info!(
+        "socket opened; plugin logs go to {}",
+        state.log_writer.location()
+    );
+
+    let mut daemon_log = state.broadcaster.subscribe();
+    let (replies, mut inbox) = mpsc::channel(RESPONSE_QUEUE);
+    let mut session = Session {
+        state,
+        log_limiter: RateLimiter::new(LOG_FRAMES_PER_SECOND, LOG_FRAME_BURST),
+        replies,
+        written: 0,
     };
+    let mut lagged: u64 = 0;
 
-    let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
-    let headers = [
-        ("Upgrade", "websocket"),
-        ("Connection", "Upgrade"),
-        ("Sec-WebSocket-Accept", accept.as_str()),
-    ];
-
-    let mut response = Response::empty(101);
-    for (name, value) in headers {
-        if let Some(header) = guard::make_header(name, value) {
-            response.add_header(header);
-        }
-    }
-
-    let socket = request.upgrade("websocket", response);
-
-    // Off the worker thread immediately — see the module note on threading.
-    let spawned = std::thread::Builder::new()
-        .name("bridge-log-stream".to_owned())
-        .spawn(move || {
-            let config = WebSocketConfig::default().max_message_size(Some(MAX_FRAME_BYTES));
-            let websocket = WebSocket::from_raw_socket(socket, Role::Server, Some(config));
-            pump(websocket, &writer);
-        });
-
-    if let Err(error) = spawned {
-        log::error!("could not spawn a log-stream thread: {error}");
-    }
-}
-
-fn respond_plain(request: Request, status: u16, body: &str) {
-    let response = Response::from_string(body).with_status_code(status);
-    if let Err(error) = request.respond(response) {
-        log::debug!("could not answer an upgrade: {error}");
-    }
-}
-
-use crate::broadcast::{BroadcastRecord, LogBroadcaster};
-use std::time::Duration;
-
-/// Read frames until the peer goes away, and stream daemon logs to the client.
-fn pump(mut socket: WebSocket<Box<dyn tiny_http::ReadWrite + Send>>, writer: &Arc<dyn LogWriter>) {
-    log::info!("log stream opened; writing to {}", writer.location());
-    let limiter = RateLimiter::new(FRAMES_PER_SECOND, FRAME_BURST);
-    let mut written: u64 = 0;
-
-    let broadcaster = LogBroadcaster::global();
-    let (sub_id, log_rx) = broadcaster.subscribe();
-
-    // The drain below runs once per inbound frame, because `socket.read()` blocks.
-    //
-    // It cannot be otherwise here: `tiny_http::Request::upgrade` hands back an opaque
-    // `Box<dyn ReadWrite + Send>` — a `CustomStream` with no accessor for the underlying
-    // `TcpStream` — so there is nowhere to call `set_nonblocking` or `set_read_timeout`. The
-    // `WouldBlock` arm further down is therefore unreachable with this transport. It is kept
-    // because it is correct for any transport that *can* time out, and costs nothing.
-    //
-    // KNOWN LIMITATION, deliberately not worked around here: while the page is quiet the drain
-    // does not run, so daemon→client broadcasts sit unsent until the client happens to send
-    // something. Measured: an idle client received nothing for 4s, then the whole backlog
-    // arrived the instant it sent one frame.
-    //
-    // A client-side keepalive would paper over it, at the cost of a frame per second forever.
-    // `tokio::select!` over the socket and the broadcast channel removes the problem by
-    // construction, which is a large part of why the async rewrite is worth doing.
     loop {
-        // 1. Drain pending bridge logs and send to client as a LogWriteRequest JSON text frame
-        let mut broadcast_batch: Vec<BroadcastRecord> = Vec::new();
-        while let Ok(rec) = log_rx.try_recv() {
-            broadcast_batch.push(rec);
-            if broadcast_batch.len() >= 50 {
-                break;
+        tokio::select! {
+            inbound = socket.recv() => {
+                let Some(Ok(message)) = inbound else { break };
+                match message {
+                    Message::Text(text) if session.on_text(text.as_str()).await => {}
+                    Message::Text(_) | Message::Close(_) => break,
+                    // Binary carries nothing this socket understands; ping and pong are axum's.
+                    Message::Binary(_) | Message::Ping(_) | Message::Pong(_) => {}
+                }
             }
-        }
-
-        if !broadcast_batch.is_empty() {
-            let payload = serde_json::json!({
-                "records": broadcast_batch
-            });
-            if let Ok(text) = serde_json::to_string(&payload) {
-                if socket.write(Message::Text(text.into())).is_err() || socket.flush().is_err() {
-                    break;
+            Some(reply) = inbox.recv() => {
+                if send(&mut socket, &reply).await.is_err() { break; }
+            }
+            pushed = daemon_log.recv() => {
+                match pushed {
+                    Ok(record) => {
+                        let push = ServerMessage::Push { event: "log", data: serde_json::json!(record) };
+                        if send(&mut socket, &push).await.is_err() { break; }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => lagged = lagged.saturating_add(skipped),
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         }
+    }
 
-        // 2. Block until the client sends something — a real batch, or its keepalive.
-        let message = match socket.read() {
-            Ok(message) => message,
-            Err(tungstenite::Error::Io(ref err))
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                std::thread::sleep(Duration::from_millis(25));
-                continue;
-            }
-            Err(error) => {
-                log::debug!("log stream closed: {error}");
-                break;
-            }
+    log::info!(
+        "socket closed after {} plugin log record(s); {lagged} daemon line(s) were not delivered",
+        session.written
+    );
+}
+
+/// Serialise and write one frame.
+async fn send(socket: &mut WebSocket, message: &ServerMessage) -> Result<(), ()> {
+    let text = serde_json::to_string(message).map_err(|error| {
+        log::error!("failed to encode a frame: {error}");
+    })?;
+    socket
+        .send(Message::Text(text.into()))
+        .await
+        .map_err(|error| log::debug!("socket write failed: {error}"))
+}
+
+impl Session {
+    /// Handle one text frame. `false` means the connection should be closed.
+    async fn on_text(&mut self, text: &str) -> bool {
+        let inbound = match serde_json::from_str::<ClientMessage>(text) {
+            // The parse error is not surfaced: serde quotes field names from the input, and this
+            // socket never echoes caller content.
+            Err(_) => Err("frame is not a recognised envelope".to_owned()),
+            Ok(message) => message.validate().map_err(|error| error.to_string()),
         };
 
-        match message {
-            Message::Text(text) => {
-                if !limiter.try_acquire() {
-                    log::warn!("log stream exceeded its frame rate; closing");
-                    let _ = socket.close(None);
-                    break;
-                }
-                match ingest(text.as_str(), writer) {
-                    Ok(count) => written = written.saturating_add(count),
-                    Err(reason) => log::warn!("rejected a log frame: {reason}"),
-                }
+        match inbound {
+            Ok(Inbound::Request(request)) => {
+                self.on_request(request);
+                true
             }
-            Message::Ping(payload) => {
-                // tungstenite queues the pong itself on the next write; flush it.
-                let _ = socket.write(Message::Pong(payload));
-                let _ = socket.flush();
+            Ok(Inbound::Logs(records)) => self.on_logs(records).await,
+            Err(message) => {
+                log::warn!("rejected a frame: {message}");
+                self.push_error(&message);
+                true
             }
-            Message::Close(_) => break,
-            // Binary and Pong carry nothing this endpoint understands.
-            Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
         }
     }
 
-    broadcaster.unsubscribe(sub_id);
-    log::info!("log stream ended after {written} record(s)");
+    /// Spawn the call and let its answer come back through the reply channel.
+    ///
+    /// The request rate limit is the same bucket HTTP uses, so a page cannot sidestep it by
+    /// switching transports.
+    fn on_request(&self, request: Request) {
+        if let Err(refusal) = self.state.guard.check_rate() {
+            let reply = ServerMessage::error(request.id, refusal.code(), refusal.message());
+            self.queue(reply);
+            return;
+        }
+
+        let services = Arc::clone(&self.state.services);
+        let replies = self.replies.clone();
+        tokio::spawn(async move {
+            let id = request.id.clone();
+            let reply =
+                match super::dispatch(&services, request.service, request.method, request.params)
+                    .await
+                {
+                    Ok(value) => ServerMessage::ok(id, value),
+                    Err(error) => ServerMessage::from_service_error(id, &error),
+                };
+            let _ = replies.send(reply).await;
+        });
+    }
+
+    /// Validate and append a log batch. `false` if the connection has exceeded its log budget.
+    async fn on_logs(&mut self, records: Vec<LogRecordIn>) -> bool {
+        if !self.log_limiter.try_acquire() {
+            log::warn!("socket exceeded its log frame rate; closing");
+            return false;
+        }
+        let writer = Arc::clone(&self.state.log_writer);
+        match ingest(records, writer).await {
+            Ok(count) => self.written = self.written.saturating_add(count),
+            Err(reason) => log::warn!("rejected a log frame: {reason}"),
+        }
+        true
+    }
+
+    /// Tell the peer a frame was refused. There is no id to answer under, so it is a push.
+    fn push_error(&self, message: &str) {
+        self.queue(ServerMessage::Push {
+            event: "error",
+            data: serde_json::json!({ "code": "bad_request", "message": message }),
+        });
+    }
+
+    /// Queue a frame for the session loop to write.
+    ///
+    /// `try_send` rather than `send`: the loop is the only thing draining this channel, and it is
+    /// the thing calling here, so waiting on it would be waiting on ourselves. A full queue means
+    /// the peer is not reading, and one dropped error frame is the least of its problems.
+    fn queue(&self, message: ServerMessage) {
+        if self.replies.try_send(message).is_err() {
+            log::debug!("reply queue full; dropped a frame");
+        }
+    }
 }
 
-/// Parse, validate and append one frame's worth of records.
-fn ingest(text: &str, writer: &Arc<dyn LogWriter>) -> Result<u64, String> {
-    let request: LogWriteRequest = serde_json::from_str(text).map_err(|error| error.to_string())?;
-    let records = request.validate().map_err(|error| error.to_string())?;
-    writer.append(&records)?;
-    Ok(records.len() as u64)
+/// Validate and append one batch, off the runtime's async threads.
+async fn ingest(records: Vec<LogRecordIn>, writer: Arc<dyn LogWriter>) -> Result<u64, String> {
+    tokio::task::spawn_blocking(move || {
+        let records = LogWriteRequest { records }
+            .validate()
+            .map_err(|error| error.to_string())?;
+        writer.append(&records)?;
+        Ok(records.len() as u64)
+    })
+    .await
+    .unwrap_or_else(|join_error| Err(format!("log writer failed: {join_error}")))
 }

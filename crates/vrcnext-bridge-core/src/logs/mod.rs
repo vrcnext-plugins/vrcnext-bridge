@@ -10,9 +10,9 @@
 //! Streaming them here gives a real file on disk that `tail -f` can follow.
 //!
 //! ```text
-//! POST /v1/logs/write   a batch, over ordinary HTTP
-//! WS   /v1/logs/stream  a live stream
-//! POST /v1/logs/info    where the file is and how big it has grown
+//! {"type":"logs","records":[…]}   a batch over the WebSocket, fire-and-forget — the normal path
+//! logs/write                       the same batch as an ordinary service call, acknowledged
+//! logs/info                        where the file is and how big it has grown
 //! ```
 //!
 //! # This is a write-only sink
@@ -47,12 +47,6 @@ impl LogService {
     #[must_use]
     pub const fn new(writer: Arc<dyn LogWriter>) -> Self {
         Self { writer }
-    }
-
-    /// The writer, so the transport can share it with the WebSocket handler.
-    #[must_use]
-    pub fn writer(&self) -> Arc<dyn LogWriter> {
-        Arc::clone(&self.writer)
     }
 
     /// Validate a batch and append it.
@@ -98,7 +92,6 @@ impl Service for LogService {
     fn describe(&self) -> Value {
         serde_json::json!({
             "methods": ["write", "info"],
-            "stream": "/v1/logs/stream",
             "location": self.writer.location(),
         })
     }

@@ -20,7 +20,7 @@ pub(crate) enum SinkChoice {
 
 /// A loopback capability bridge for VRCNext plugins.
 ///
-/// Serves `POST /v1/<service>/<method>` to the VRCNext page and nothing else. Notifications are
+/// Serves one WebSocket and `POST /v1/<service>/<method>` to the VRCNext page, nothing else. Notifications are
 /// the first service; each notification target is a separately addressable sink.
 #[derive(Debug, Parser)]
 #[command(name = "vrcnext-bridge", version, about, long_about = None)]
@@ -59,7 +59,7 @@ pub(crate) struct Config {
     #[arg(long, default_value_t = 10)]
     pub(crate) burst: u32,
 
-    /// Worker threads. Requests are short and I/O-bound, so a handful is plenty.
+    /// Runtime worker threads. Services run on a separate blocking pool, so a handful is plenty.
     #[arg(long, default_value_t = 4)]
     pub(crate) threads: usize,
 
