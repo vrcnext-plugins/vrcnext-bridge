@@ -5,6 +5,14 @@ name: release
 on:
   push:
     tags: ['v*']
+  # Manual runs create the tag and release from the checked-out commit, for environments that can
+  # push branches but not tags.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Tag to release, e.g. v0.2.0'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -79,5 +87,7 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.version || github.ref_name }}
+          target_commitish: ${{ github.sha }}
           files: assets/*
           generate_release_notes: true
