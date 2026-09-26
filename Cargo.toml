@@ -13,6 +13,7 @@ authors = ["vrcnext-plugins"]
 [workspace.dependencies]
 vrcnext-bridge-core = { path = "crates/vrcnext-bridge-core", version = "0.1.0" }
 vrcnext-bridge-sinks = { path = "crates/vrcnext-bridge-sinks", version = "0.1.0" }
+vrcnext-bridge-plugins = { path = "crates/vrcnext-bridge-plugins", version = "0.1.0" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }

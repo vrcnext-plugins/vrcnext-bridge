@@ -5,9 +5,11 @@
 
 use std::sync::Arc;
 
+use anyhow::{Context as _, Result};
 use vrcnext_bridge_core::logs::{LogService, LogWriter, NullLogWriter};
 use vrcnext_bridge_core::notify::{NotifyService, SinkSet};
 use vrcnext_bridge_core::{Paths, Service, ServiceRegistry};
+use vrcnext_bridge_plugins::{StateService, StateStore};
 use vrcnext_bridge_sinks::{FreedesktopSink, WayvrSink};
 
 use crate::config::{Config, SinkChoice};
@@ -20,18 +22,25 @@ pub(crate) struct Wiring {
 }
 
 /// Build every service this bridge will offer.
-#[must_use]
-pub(crate) fn build_services(config: &Config, _paths: &Paths) -> Wiring {
+///
+/// # Errors
+///
+/// Fails if the state file exists but cannot be read: it holds the user's plugin settings, and
+/// starting without it would let the next write silently replace them.
+pub(crate) fn build_services(config: &Config, paths: &Paths) -> Result<Wiring> {
     let log_writer = build_log_writer(config);
+    let state =
+        Arc::new(StateStore::open(paths.state_file()).context("cannot open the state store")?);
 
     let mut registry = ServiceRegistry::new();
     registry.register(Arc::new(NotifyService::new(build_sinks(config))) as Arc<dyn Service>);
     registry.register(Arc::new(LogService::new(Arc::clone(&log_writer))) as Arc<dyn Service>);
+    registry.register(Arc::new(StateService::new(state)) as Arc<dyn Service>);
 
-    Wiring {
+    Ok(Wiring {
         services: registry,
         log_writer,
-    }
+    })
 }
 
 /// Open the log file, or fall back to discarding.

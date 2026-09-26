@@ -1474,6 +1474,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "vrcnext-bridge-core",
+ "vrcnext-bridge-plugins",
  "vrcnext-bridge-sinks",
 ]
 
@@ -1486,6 +1487,17 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "vrcnext-bridge-plugins"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "vrcnext-bridge-core",
 ]
 
 [[package]]

@@ -12,6 +12,7 @@ default-run = "vrcnext-bridge"
 [dependencies]
 vrcnext-bridge-core.workspace = true
 vrcnext-bridge-sinks.workspace = true
+vrcnext-bridge-plugins.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 env_logger.workspace = true

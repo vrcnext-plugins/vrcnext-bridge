@@ -46,7 +46,7 @@ fn main() -> Result<()> {
     let broadcaster = BroadcastLogger::install(logger).context("failed to initialise logger")?;
 
     let token = token::load_or_create(&paths.token_file())?;
-    let wiring = startup::build_services(&config, &paths);
+    let wiring = startup::build_services(&config, &paths)?;
     startup::log_banner(&config, &paths, &token, &wiring.services);
 
     // Services and sinks are synchronous and stay that way; the runtime hands each call to a
