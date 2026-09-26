@@ -14,6 +14,7 @@ authors = ["vrcnext-plugins"]
 vrcnext-bridge-core = { path = "crates/vrcnext-bridge-core", version = "0.1.0" }
 vrcnext-bridge-sinks = { path = "crates/vrcnext-bridge-sinks", version = "0.1.0" }
 vrcnext-bridge-plugins = { path = "crates/vrcnext-bridge-plugins", version = "0.1.0" }
+vrcnext-bridge-win = { path = "crates/vrcnext-bridge-win", version = "0.1.0" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -30,6 +31,19 @@ getrandom = "0.4"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+# Git, in pure Rust: no shell, no system git, TLS via rustls. Only the pieces a depth-1 clone,
+# a fetch and a worktree checkout need; the default set pulls in blame, merge and status.
+gix = { version = "0.88", default-features = false, features = [
+    "blocking-http-transport-reqwest-rust-tls",
+    "worktree-mutation",
+    "revision",
+    "max-performance-safe",
+    "sha1",
+] }
+# SHA-256 for the esbuild checksum.
+sha2 = "0.11"
+# Win32 bindings for the native confirmation dialog. Pure Rust, no headers.
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -17,7 +17,7 @@
 //! # Shape of the session
 //!
 //! One task per socket, `select!`ing over three things: frames from the peer, responses coming
-//! back from service calls, and the daemon's log broadcast. Nothing blocks in that loop — service
+//! back from service calls, and the broadcast of daemon log lines and service pushes. Nothing blocks in that loop — service
 //! calls are spawned onto the blocking pool and answer through a channel — so a slow D-Bus call
 //! neither delays a quick one nor stops log lines flowing.
 
@@ -36,6 +36,7 @@ use vrcnext_bridge_core::handshake::{
 use vrcnext_bridge_core::logs::{LogRecordIn, LogWriteRequest, LogWriter};
 
 use super::AppState;
+use crate::broadcast::Outbound;
 
 /// How long a fresh socket has to send its `hello`.
 const HELLO_DEADLINE: Duration = Duration::from_secs(5);
@@ -99,7 +100,7 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
-    let mut daemon_log = state.broadcaster.subscribe();
+    let mut outbound = state.broadcaster.subscribe();
     let (replies, mut inbox) = mpsc::channel(RESPONSE_QUEUE);
     let mut session = Session {
         state,
@@ -123,10 +124,13 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>) {
             Some(reply) = inbox.recv() => {
                 if send(&mut socket, &reply).await.is_err() { break; }
             }
-            pushed = daemon_log.recv() => {
+            pushed = outbound.recv() => {
                 match pushed {
-                    Ok(record) => {
-                        let push = ServerMessage::Push { event: "log", data: serde_json::json!(record) };
+                    Ok(frame) => {
+                        let push = match frame {
+                            Outbound::Log(record) => ServerMessage::Push { event: "log", data: serde_json::json!(record) },
+                            Outbound::Push { event, data } => ServerMessage::Push { event, data },
+                        };
                         if send(&mut socket, &push).await.is_err() { break; }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => lagged = lagged.saturating_add(skipped),
@@ -137,7 +141,7 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>) {
     }
 
     log::info!(
-        "socket closed after {} plugin log record(s); {lagged} daemon line(s) were not delivered",
+        "socket closed after {} plugin log record(s); {lagged} pushed frame(s) were not delivered",
         session.written
     );
 }

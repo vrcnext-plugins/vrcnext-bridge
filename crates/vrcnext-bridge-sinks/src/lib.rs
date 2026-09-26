@@ -1,6 +1,7 @@
-//! Concrete [`Sink`](vrcnext_bridge_core::Sink) implementations.
+//! Concrete [`Sink`](vrcnext_bridge_core::Sink) implementations, and the native confirmation
+//! prompt for the platforms that have a session bus.
 //!
-//! Two ship today:
+//! Two sinks ship today:
 //!
 //! | Sink | Transport | Reaches |
 //! | :--- | :--- | :--- |
@@ -13,10 +14,19 @@
 //! protocol has no concept of: panel height, opacity, always-show-over-dashboard. A plugin that
 //! wants a big translucent panel in VR *and nothing on the monitor* names `wayvr` alone.
 //!
+//! The freedesktop sink and the [`approve`] prompt exist only on unix: there is no session bus
+//! elsewhere, and leaving them out is what lets the binary build for Windows.
+//!
 //! Neither sink executes anything. See the rule in [`vrcnext_bridge_core::Sink`].
 
+#[cfg(unix)]
+pub mod approve;
+#[cfg(unix)]
 pub mod freedesktop;
 pub mod wayvr;
 
+#[cfg(unix)]
+pub use approve::FreedesktopApprover;
+#[cfg(unix)]
 pub use freedesktop::FreedesktopSink;
 pub use wayvr::{DEFAULT_WAYVR_ADDR, WayvrSink};

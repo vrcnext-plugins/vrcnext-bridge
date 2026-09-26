@@ -14,7 +14,8 @@ pub(crate) const DEFAULT_LISTEN: &str = "127.0.0.1:42081";
 pub(crate) enum SinkChoice {
     /// WayVR / XSOverlay protocol over UDP.
     Wayvr,
-    /// The desktop's freedesktop notification daemon over D-Bus.
+    /// The desktop's freedesktop notification daemon over D-Bus. Unix only.
+    #[cfg(unix)]
     Freedesktop,
 }
 
@@ -119,7 +120,11 @@ impl Config {
     #[must_use]
     pub(crate) fn requested_sinks(&self) -> Vec<SinkChoice> {
         if self.sinks.is_empty() {
-            vec![SinkChoice::Wayvr, SinkChoice::Freedesktop]
+            vec![
+                SinkChoice::Wayvr,
+                #[cfg(unix)]
+                SinkChoice::Freedesktop,
+            ]
         } else {
             let mut chosen = self.sinks.clone();
             chosen.dedup();

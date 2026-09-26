@@ -14,6 +14,10 @@ log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+# The session bus exists only on unix desktops; gating it here is what lets the binary
+# cross-compile for Windows.
+[target.'cfg(unix)'.dependencies]
 zbus.workspace = true
 
 [lints]

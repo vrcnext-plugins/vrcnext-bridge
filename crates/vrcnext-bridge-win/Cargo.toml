@@ -1,0 +1,43 @@
+[package]
+name = "vrcnext-bridge-win"
+description = "The Windows native confirmation prompt for vrcnext-bridge: one MessageBoxW call."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+vrcnext-bridge-core.workspace = true
+log.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+# The workspace forbids unsafe code, and this crate exists so that rule can stay a `forbid`
+# everywhere else: calling into user32 is FFI and cannot be anything but unsafe. Every other lint
+# is the workspace's, repeated here because a crate-level `[lints]` table replaces inheritance.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+integer_division = "deny"
+too_many_lines = "deny"
+cast_possible_truncation = "deny"
+cast_precision_loss = "deny"
+cast_sign_loss = "deny"
+float_cmp = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+dbg_macro = "deny"

@@ -178,7 +178,7 @@ fn exe_name(base: &str) -> String {
 ///
 /// The id names a directory, so its shape is a security boundary, not a style preference. It is
 /// the only thing this module will join into a path.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct PluginId(String);
 
 /// Why a string is not a plugin id.

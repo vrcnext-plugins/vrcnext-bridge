@@ -41,15 +41,18 @@
 //! `vrcnext-bridge-sinks`, which keeps validation, dispatch and rate limiting testable without a
 //! D-Bus session, a VR runtime or a listening socket.
 
+pub mod approve;
 pub mod envelope;
 pub mod handshake;
 pub mod limits;
 pub mod logs;
 pub mod notify;
 pub mod paths;
+pub mod pusher;
 pub mod ratelimit;
 pub mod service;
 
+pub use approve::{APPROVAL_DEADLINE_SECS, Approval, ApprovalRequest, Approver, NullApprover};
 pub use envelope::{ClientMessage, EnvelopeError, Inbound, Request, ServerMessage};
 pub use logs::{LogLevel, LogRecord, LogService, LogWriter, NullLogWriter};
 pub use notify::{
@@ -57,5 +60,6 @@ pub use notify::{
     ValidationError,
 };
 pub use paths::{Paths, PluginId};
+pub use pusher::{NullPusher, Pusher, RecordingPusher};
 pub use ratelimit::RateLimiter;
 pub use service::{Service, ServiceError, ServiceRegistry};

@@ -10,7 +10,10 @@ authors.workspace = true
 
 [dependencies]
 vrcnext-bridge-core.workspace = true
+getrandom.workspace = true
+gix.workspace = true
 log.workspace = true
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
