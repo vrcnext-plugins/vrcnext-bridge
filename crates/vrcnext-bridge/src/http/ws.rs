@@ -8,8 +8,11 @@
 //! # Admission
 //!
 //! The [`super::guard`] middleware has already run by the time the upgrade reaches this module,
-//! so an origin that is not allow-listed never gets here. See the guard for why that is the only
-//! defence a WebSocket has.
+//! so an origin that is not allow-listed never gets here. The pairing token cannot travel in a
+//! header — a browser sets none on an upgrade — so it comes in the first frame instead: the
+//! socket is locked until a valid `hello` arrives, and closed with 1008 if the first frame is
+//! anything else or nothing arrives within [`HELLO_DEADLINE`]. See
+//! [`vrcnext_bridge_core::handshake`] for the frames and the refusals.
 //!
 //! # Shape of the session
 //!
@@ -19,16 +22,23 @@
 //! neither delays a quick one nor stops log lines flowing.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
 use tokio::sync::{broadcast, mpsc};
 use vrcnext_bridge_core::RateLimiter;
 use vrcnext_bridge_core::envelope::{ClientMessage, Inbound, Request, ServerMessage};
+use vrcnext_bridge_core::handshake::{
+    Accepted, CLOSE_POLICY_VIOLATION, HelloRefusal, Welcome, check_hello,
+};
 use vrcnext_bridge_core::logs::{LogRecordIn, LogWriteRequest, LogWriter};
 
 use super::AppState;
+
+/// How long a fresh socket has to send its `hello`.
+const HELLO_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Largest frame accepted. A batch of 200 records at 4000 characters each cannot exceed this.
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -58,10 +68,36 @@ struct Session {
 }
 
 async fn session(mut socket: WebSocket, state: Arc<AppState>) {
+    let accepted = match handshake(&mut socket, &state).await {
+        Ok(accepted) => accepted,
+        Err(refusal) => {
+            // Charged before the close so that a peer looping on reconnects pays per attempt.
+            state.guard.penalise();
+            log::warn!("socket refused: {}", refusal.close_reason());
+            let close = Message::Close(Some(CloseFrame {
+                code: CLOSE_POLICY_VIOLATION,
+                reason: refusal.close_reason().into(),
+            }));
+            let _ = socket.send(close).await;
+            return;
+        }
+    };
     log::info!(
-        "socket opened; plugin logs go to {}",
+        "socket opened by {}; plugin logs go to {}",
+        accepted.client,
         state.log_writer.location()
     );
+
+    let welcome = Welcome::Welcome {
+        version: crate::VERSION,
+        services: state.services.describe(),
+    };
+    let Ok(text) = serde_json::to_string(&welcome) else {
+        return;
+    };
+    if socket.send(Message::Text(text.into())).await.is_err() {
+        return;
+    }
 
     let mut daemon_log = state.broadcaster.subscribe();
     let (replies, mut inbox) = mpsc::channel(RESPONSE_QUEUE);
@@ -104,6 +140,19 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>) {
         "socket closed after {} plugin log record(s); {lagged} daemon line(s) were not delivered",
         session.written
     );
+}
+
+/// Wait for the first frame and judge it.
+///
+/// Only a text frame can be a hello. A close, a binary frame, a transport error or silence past
+/// the deadline all count as "no hello": the peer is told which with the close reason, and
+/// nothing it sent is dispatched.
+async fn handshake(socket: &mut WebSocket, state: &AppState) -> Result<Accepted, HelloRefusal> {
+    let first = tokio::time::timeout(HELLO_DEADLINE, socket.recv()).await;
+    let Ok(Some(Ok(Message::Text(text)))) = first else {
+        return Err(HelloRefusal::HelloRequired);
+    };
+    check_hello(text.as_str(), state.guard.token())
 }
 
 /// Serialise and write one frame.

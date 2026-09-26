@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use vrcnext_bridge_core::logs::{LogService, LogWriter, NullLogWriter};
 use vrcnext_bridge_core::notify::{NotifyService, SinkSet};
-use vrcnext_bridge_core::{Service, ServiceRegistry};
+use vrcnext_bridge_core::{Paths, Service, ServiceRegistry};
 use vrcnext_bridge_sinks::{FreedesktopSink, WayvrSink};
 
 use crate::config::{Config, SinkChoice};
@@ -21,7 +21,7 @@ pub(crate) struct Wiring {
 
 /// Build every service this bridge will offer.
 #[must_use]
-pub(crate) fn build_services(config: &Config) -> Wiring {
+pub(crate) fn build_services(config: &Config, _paths: &Paths) -> Wiring {
     let log_writer = build_log_writer(config);
 
     let mut registry = ServiceRegistry::new();
@@ -77,13 +77,18 @@ fn build_sinks(config: &Config) -> SinkSet {
     sinks
 }
 
-/// Log exactly what is running: which services, which sinks, and whether a token is required.
+/// Log exactly what is running: which services, which sinks, where the data lives, and the
+/// pairing token.
 ///
-/// Deliberately explicit. A bridge that silently came up with zero sinks, or with the token
-/// disabled because the environment variable was misspelled, is the kind of thing someone should
-/// see in the first ten lines of output rather than discover later.
-pub(crate) fn log_banner(config: &Config, services: &ServiceRegistry) {
+/// Deliberately explicit. A bridge that silently came up with zero sinks is the kind of thing
+/// someone should see in the first ten lines of output rather than discover later. The token is
+/// printed on every start because the banner is where a user goes to find it: the alternative is
+/// a file path they have to know about.
+pub(crate) fn log_banner(config: &Config, paths: &Paths, token: &str, services: &ServiceRegistry) {
     log::info!("vrcnext-bridge {}", crate::VERSION);
+    log::info!("data directory: {}", paths.root().display());
+    log::info!("theme directory: {}", paths.theme_dir().display());
+    log::info!("pairing token: {token}  (paste this into the Plugins tab)");
 
     for service in services.services() {
         log::info!("service `{}`: {}", service.name(), service.summary());
@@ -118,11 +123,6 @@ pub(crate) fn log_banner(config: &Config, services: &ServiceRegistry) {
         log::info!("plugin logs: {logs}");
     }
 
-    if config.token.is_some() {
-        log::info!("bearer token required");
-    } else {
-        log::info!("no bearer token set; relying on the loopback bind and the origin allowlist");
-    }
     if config.allow_origins.is_empty() {
         log::info!("origins: loopback only");
     } else {

@@ -26,7 +26,20 @@ without touching the transport, the request guard, the rate limiter, or the wiri
 
 ## The socket
 
-The plugin system opens `/v1/ws` once and keeps it open. Every frame is JSON with a `type`:
+The plugin system opens `/v1/ws` once and keeps it open. Every frame is JSON with a `type`. The
+first frame **must** be a `hello` carrying the pairing token; until the bridge answers `welcome`
+the socket carries nothing.
+
+```jsonc
+// page → bridge, first frame
+{ "type": "hello", "token": "<pairing token>", "client": "vrcnext-plugin-system/0.2.0" }
+// bridge → page: the socket is unlocked. `services` is the same payload as GET /v1/describe.
+{ "type": "welcome", "version": "0.1.0", "services": { "state": { "summary": "…" } } }
+```
+
+Any other first frame, a wrong token, or no `hello` within 5 seconds closes the socket with code
+`1008` and reason `hello_required` or `unauthorized`. A failed hello costs a rate-limit token, so
+guessing is slow. After `welcome`:
 
 ```jsonc
 // page → bridge: a call, answered under the same id. Several may be in flight.
@@ -54,15 +67,16 @@ can put a big translucent panel in front of someone in VR and leave their monito
 
 ```bash
 # VR only
+TOKEN="$(vrcnext-bridge --print-token)"
 curl -X POST http://127.0.0.1:42081/v1/notify/send \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"title":"Friend online","sinks":["wayvr"],"height":220,"opacity":0.85}'
 ```
 
 ```bash
 # Both, presented differently in each
 curl -X POST http://127.0.0.1:42081/v1/notify/send \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{
         "title": "Friend online",
         "content": "on the desktop",
@@ -77,7 +91,7 @@ does not run costs nothing.
 Ask what exists rather than hard-coding names:
 
 ```bash
-curl http://127.0.0.1:42081/v1/describe
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:42081/v1/describe
 ```
 
 Each target reports which fields it `honours` — panel height means something to `wayvr` and nothing
@@ -108,9 +122,9 @@ Honest accounting, because this was reverse-engineered rather than read from a s
 
 | Method | Path | Purpose |
 | :--- | :--- | :--- |
-| `GET` | `/v1/health` | liveness, version, service names — how the plugin system tells "running" from "not installed" |
-| `GET` | `/v1/describe` | every service, method and target, with health |
-| `GET` | `/v1/ws` | the WebSocket upgrade |
+| `GET` | `/v1/health` | liveness, version, service names — how the plugin system tells "running" from "not installed". **No token needed**: it is the probe. |
+| `GET` | `/v1/describe` | every service, method and target, with health. Bearer required. |
+| `GET` | `/v1/ws` | the WebSocket upgrade; the token goes in the first frame |
 | `POST` | `/v1/notify/send` | deliver a notification |
 | `POST` | `/v1/notify/targets` | targets and the fields each honours |
 | `POST` | `/v1/logs/write` | append a batch of plugin log lines to the log file |
@@ -137,9 +151,15 @@ What is done about it:
   origins that are not allow-listed. `Access-Control-Allow-Origin` is never `*` and never reflects
   an arbitrary origin.
 - **The WebSocket checks `Origin` itself.** CORS does not protect an upgrade: a browser completes
-  a `ws://127.0.0.1` handshake from any page, with no preflight. The same origin allowlist and
-  bearer check therefore run in front of the upgrade, and a bad origin is answered 403 before a
-  frame is read.
+  a `ws://127.0.0.1` handshake from any page, with no preflight. The origin allowlist therefore
+  runs in front of the upgrade, and a bad origin is answered 403 before a frame is read. The
+  pairing token is checked in the first frame, since a browser cannot set headers on an upgrade.
+- **A pairing token, always.** Generated on first run — 32 random bytes, base64url — and stored
+  `0600` at `~/.vrcnext-plugins/token`. Every `POST` carries it as `Authorization: Bearer …`, every
+  socket presents it in `hello`. Only `GET /v1/health` answers without it. The banner prints it on
+  every start; `--print-token` prints it and exits; `--rotate-token` replaces it. Anything that
+  can read the file already runs as this user, so the token adds nothing against that caller and
+  everything against a page or a process that does not.
 - **Loopback only, with no override flag.** `--listen` refuses a non-loopback address. There is
   deliberately no way to force it; such a flag would exist only to be misused.
 - **No sink may ever execute a program, open a shell, or write to a caller-chosen path.** This is
@@ -157,9 +177,6 @@ What is done about it:
 - **Error messages never echo caller input.** The one exception — an unknown sink's name — is both
   validated before selection and truncated at the point of formatting, because an error message is
   the last place that should reflect an unbounded caller-supplied string.
-
-An optional `--token` adds a bearer check for shared or multi-user machines, where the assumption
-behind class (2) stops holding.
 
 ## Install
 

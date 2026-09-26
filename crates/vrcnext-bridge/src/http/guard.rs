@@ -34,7 +34,9 @@
 //! `Access-Control-Allow-Origin` to withhold. What it *does* send is an `Origin` header, and
 //! checking it server-side is the only defence. The guard therefore runs as middleware in front of
 //! every route, the upgrade included: an upgrade from an origin that is not allow-listed is
-//! answered 403 before a single frame is read.
+//! answered 403 before a single frame is read. The pairing token is then presented in the first
+//! frame — see [`vrcnext_bridge_core::handshake`] — because a browser cannot set headers on an
+//! upgrade.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,6 +46,7 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse as _, Response};
 use vrcnext_bridge_core::RateLimiter;
+use vrcnext_bridge_core::handshake::constant_time_eq;
 
 use super::respond::{add_header, cors_headers, error};
 use crate::config::Config;
@@ -165,19 +168,33 @@ impl OriginPolicy {
 /// Everything checked before a request reaches a service.
 pub(crate) struct Guard {
     origins: OriginPolicy,
-    token: Option<String>,
+    token: String,
     limiter: RateLimiter,
 }
 
 impl Guard {
-    /// Build the guard from configuration.
+    /// Build the guard from configuration and the pairing token.
     #[must_use]
-    pub(crate) fn new(config: &Config) -> Self {
+    pub(crate) fn new(config: &Config, token: String) -> Self {
         Self {
             origins: OriginPolicy::new(config.allow_origins.clone()),
-            token: config.token.clone(),
+            token,
             limiter: RateLimiter::new(config.rate, config.burst),
         }
+    }
+
+    /// The pairing token, for the socket handshake.
+    #[must_use]
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Charge one rate-limit token without asking whether one was available.
+    ///
+    /// A failed `hello` costs the peer as much as a request would: guessing tokens must not be
+    /// free, and the bucket is the only thing on this path that slows a guesser down.
+    pub(crate) fn penalise(&self) {
+        let _ = self.limiter.try_acquire();
     }
 
     /// Take a rate-limit token.
@@ -197,27 +214,38 @@ impl Guard {
         }
     }
 
-    /// Check origin and credentials. Applies to preflights as well as real requests.
+    /// Check the origin. Applies to preflights as well as real requests.
     ///
     /// # Errors
     ///
-    /// Returns the first [`Refusal`] that applies.
-    pub(crate) fn check_admission(&self, headers: &HeaderMap) -> Result<(), Refusal> {
+    /// [`Refusal::ForbiddenOrigin`] if an `Origin` is present and not allow-listed.
+    pub(crate) fn check_origin(&self, headers: &HeaderMap) -> Result<(), Refusal> {
         if let Some(origin) = header(headers, header::ORIGIN) {
             if !self.origins.allows(origin) {
                 log::warn!("refused request from origin {}", origin.escape_debug());
                 return Err(Refusal::ForbiddenOrigin);
             }
         }
-
-        if let Some(expected) = &self.token {
-            let presented = header(headers, header::AUTHORIZATION)
-                .and_then(|value| value.strip_prefix("Bearer "));
-            if !presented.is_some_and(|token| constant_time_eq(token, expected)) {
-                return Err(Refusal::Unauthorized);
-            }
-        }
         Ok(())
+    }
+
+    /// Require `Authorization: Bearer <token>`.
+    ///
+    /// Not part of the middleware, because a preflight cannot carry credentials and the health
+    /// probe must answer before the page has a token to present. Every service call and the
+    /// describe endpoint check it; the socket presents the same token in its `hello` instead.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Unauthorized`] if the header is absent or wrong.
+    pub(crate) fn check_bearer(&self, headers: &HeaderMap) -> Result<(), Refusal> {
+        let presented =
+            header(headers, header::AUTHORIZATION).and_then(|value| value.strip_prefix("Bearer "));
+        if presented.is_some_and(|token| constant_time_eq(token, &self.token)) {
+            Ok(())
+        } else {
+            Err(Refusal::Unauthorized)
+        }
     }
 
     /// Check the things that only apply to a request with a body.
@@ -254,11 +282,12 @@ impl Guard {
     }
 }
 
-/// The middleware in front of every route: rate limit, admission, preflight, CORS headers.
+/// The middleware in front of every route: rate limit, origin, preflight, CORS headers.
 ///
 /// Order matters. The rate limit comes first so that a refused origin hammering the daemon still
-/// costs it tokens; admission second so a preflight from a bad origin is refused rather than
-/// answered; and the preflight answer third, so only an allow-listed origin ever gets its 204.
+/// costs it tokens; the origin check second so a preflight from a bad origin is refused rather
+/// than answered; and the preflight answer third, so only an allow-listed origin ever gets its
+/// 204. The bearer token is checked per route, not here: see [`Guard::check_bearer`].
 pub(crate) async fn middleware(
     State(guard): State<Arc<Guard>>,
     request: Request,
@@ -274,7 +303,7 @@ pub(crate) async fn middleware(
 
     let mut response = match guard
         .check_rate()
-        .and_then(|()| guard.check_admission(request.headers()))
+        .and_then(|()| guard.check_origin(request.headers()))
     {
         Err(refusal) => refuse(&refusal),
         // The preflight. Answering it is what lets the browser send the real request; refusing
@@ -306,20 +335,6 @@ fn header(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
-/// Compare two secrets without leaking their common prefix through timing.
-///
-/// The length difference is still observable, which is acceptable: the token is generated, not
-/// user-chosen, and its length is not the secret.
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.bytes()
-        .zip(b.bytes())
-        .fold(0_u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -329,7 +344,7 @@ mod tests {
         clippy::indexing_slicing,
         reason = "a failing assertion is how a test reports; panicking here is the point"
     )]
-    use super::{OriginPolicy, constant_time_eq};
+    use super::OriginPolicy;
 
     fn policy() -> OriginPolicy {
         OriginPolicy::new(vec!["https://vrcnext.example".to_owned()])
@@ -380,12 +395,5 @@ mod tests {
     fn honours_explicitly_allowed_origins_exactly() {
         assert!(policy().allows("https://vrcnext.example"));
         assert!(!policy().allows("https://vrcnext.example.evil.com"));
-    }
-
-    #[test]
-    fn token_comparison_rejects_mismatches() {
-        assert!(constant_time_eq("abcdef", "abcdef"));
-        assert!(!constant_time_eq("abcdef", "abcdeg"));
-        assert!(!constant_time_eq("abcdef", "abcde"));
     }
 }

@@ -1,0 +1,19 @@
+# The full gate (fmt, clippy pedantic, tests, doc, release build) on every push and PR.
+name: ci
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml selects the channel and components on first cargo invocation.
+      - uses: Swatinem/rust-cache@v2
+      - run: ./scripts/build.sh

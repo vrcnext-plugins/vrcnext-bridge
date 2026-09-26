@@ -42,9 +42,11 @@
 //! D-Bus session, a VR runtime or a listening socket.
 
 pub mod envelope;
+pub mod handshake;
 pub mod limits;
 pub mod logs;
 pub mod notify;
+pub mod paths;
 pub mod ratelimit;
 pub mod service;
 
@@ -54,5 +56,6 @@ pub use notify::{
     Notification, NotifyRequest, NotifyService, Sink, SinkError, SinkHealth, Urgency,
     ValidationError,
 };
+pub use paths::{Paths, PluginId};
 pub use ratelimit::RateLimiter;
 pub use service::{Service, ServiceError, ServiceRegistry};

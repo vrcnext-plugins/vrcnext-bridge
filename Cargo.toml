@@ -21,6 +21,10 @@ env_logger = { version = "0.11", default-features = false, features = ["humantim
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# Platform directories (home, %LOCALAPPDATA%, %APPDATA%). Pure Rust, no I/O beyond env/getpwuid.
+dirs = "7"
+# Randomness for the pairing token, straight from the OS.
+getrandom = "0.4"
 # Transport. No TLS anywhere: the bridge is loopback-only and stays pure Rust.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }

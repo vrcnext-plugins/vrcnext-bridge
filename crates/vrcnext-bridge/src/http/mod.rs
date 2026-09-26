@@ -42,8 +42,13 @@ pub(crate) struct AppState {
 /// # Errors
 ///
 /// Fails if the address cannot be bound, or the server stops on an error.
-pub(crate) async fn serve(config: &Config, wiring: Wiring, broadcaster: Broadcaster) -> Result<()> {
-    let guard = Arc::new(Guard::new(config));
+pub(crate) async fn serve(
+    config: &Config,
+    token: String,
+    wiring: Wiring,
+    broadcaster: Broadcaster,
+) -> Result<()> {
+    let guard = Arc::new(Guard::new(config, token));
     let state = Arc::new(AppState {
         guard: Arc::clone(&guard),
         services: Arc::new(wiring.services),
@@ -90,7 +95,12 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
     )
 }
 
-async fn describe(State(state): State<Arc<AppState>>) -> Response {
+/// `GET /v1/describe` — every service and target. Bearer-gated: it lists what this bridge can
+/// do, and a page that has not paired has no business knowing.
+async fn describe(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(refusal) = state.guard.check_bearer(&headers) {
+        return refuse(&refusal);
+    }
     json(
         200,
         &serde_json::json!({
@@ -122,6 +132,9 @@ async fn call(
 ) -> Response {
     if !is_name(&service) || !is_name(&method) {
         return not_found().await;
+    }
+    if let Err(refusal) = state.guard.check_bearer(&headers) {
+        return refuse(&refusal);
     }
     if let Err(refusal) = Guard::check_body(&headers, limits::MAX_BODY_BYTES) {
         return refuse(&refusal);

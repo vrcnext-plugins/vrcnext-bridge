@@ -1,0 +1,83 @@
+# On a v* tag: build the bridge for the three supported targets, name the assets exactly as the
+# installers expect them, and publish them with a combined SHA256SUMS.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            asset: vrcnext-bridge-linux-x86_64
+            bin: vrcnext-bridge
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            asset: vrcnext-bridge-windows-x86_64.exe
+            bin: vrcnext-bridge.exe
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            asset: vrcnext-bridge-macos-aarch64
+            bin: vrcnext-bridge
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel; only the extra target must be added.
+      - name: Install toolchain target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "out/${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd assets
+          chmod +x vrcnext-bridge-linux-x86_64 vrcnext-bridge-macos-aarch64
+          sha256sum vrcnext-bridge-linux-x86_64 vrcnext-bridge-windows-x86_64.exe vrcnext-bridge-macos-aarch64 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*
+          generate_release_notes: true

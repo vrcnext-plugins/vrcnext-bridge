@@ -31,6 +31,10 @@ pub const MAX_NAME_CHARS: usize = 64;
 /// caller-supplied string that ends up in a response.
 pub const MAX_CORRELATION_ID_CHARS: usize = 128;
 
+/// Longest `client` string in a `hello` frame. It is logged, so it is bounded like anything else a
+/// not-yet-trusted peer can choose.
+pub const MAX_CLIENT_CHARS: usize = 128;
+
 /// Most sinks one request may name.
 pub const MAX_REQUESTED_SINKS: usize = 8;
 

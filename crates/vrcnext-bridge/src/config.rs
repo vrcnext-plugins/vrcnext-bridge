@@ -20,8 +20,8 @@ pub(crate) enum SinkChoice {
 
 /// A loopback capability bridge for VRCNext plugins.
 ///
-/// Serves one WebSocket and `POST /v1/<service>/<method>` to the VRCNext page, nothing else. Notifications are
-/// the first service; each notification target is a separately addressable sink.
+/// Serves one WebSocket and `POST /v1/<service>/<method>` to the VRCNext page, nothing else. It
+/// installs and compiles plugins, keeps the page's state, and delivers notifications.
 #[derive(Debug, Parser)]
 #[command(name = "vrcnext-bridge", version, about, long_about = None)]
 pub(crate) struct Config {
@@ -37,13 +37,20 @@ pub(crate) struct Config {
     #[arg(long, default_value = DEFAULT_WAYVR_ADDR, env = "VRCNEXT_BRIDGE_WAYVR_ADDR")]
     pub(crate) wayvr_addr: SocketAddr,
 
-    /// Require this bearer token on every request.
+    /// Data directory: plugins, host sources, state, token. Defaults to `~/.vrcnext-plugins`
+    /// (`%LOCALAPPDATA%\vrcnext-plugins` on Windows).
     ///
-    /// Optional because the CORS guard already stops drive-by requests from web pages, and the
-    /// only other things that can reach loopback are processes already running as this user. Set
-    /// it on a shared or multi-user machine, where that second assumption stops holding.
-    #[arg(long, env = "VRCNEXT_BRIDGE_TOKEN", hide_env_values = true)]
-    pub(crate) token: Option<String>,
+    /// Overriding it is how a second instance on a spare port keeps its own token and state.
+    #[arg(long, env = "VRCNEXT_BRIDGE_DATA_DIR")]
+    pub(crate) data_dir: Option<std::path::PathBuf>,
+
+    /// Replace the pairing token with a fresh one and exit. Every paired page must be re-paired.
+    #[arg(long, conflicts_with = "print_token")]
+    pub(crate) rotate_token: bool,
+
+    /// Print the pairing token (generating it if this is the first run) and exit.
+    #[arg(long)]
+    pub(crate) print_token: bool,
 
     /// Additional exact `Origin` values to accept, beyond loopback origins.
     ///
@@ -89,8 +96,7 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Fails if the listen address is not loopback, or if the token is present but trivially
-    /// short. There is deliberately no flag to override the loopback requirement: a bridge that
+    /// Fails if the listen address is not loopback. There is deliberately no flag to override the loopback requirement: a bridge that
     /// can put notifications on someone's screen has no business accepting connections from the
     /// network, and an override would exist only to be misused.
     pub(crate) fn validate(&self) -> Result<()> {
@@ -99,11 +105,6 @@ impl Config {
                 "--listen must be a loopback address; {} would accept connections from the network",
                 self.listen
             );
-        }
-        if let Some(token) = &self.token {
-            if token.chars().count() < 16 {
-                bail!("--token must be at least 16 characters to be worth having");
-            }
         }
         if !self.wayvr_addr.ip().is_loopback() {
             bail!(
