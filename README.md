@@ -1,28 +1,39 @@
 # vrcnext-bridge
 
-An optional, loopback-only companion daemon for
-[the VRCNext plugin system](https://github.com/vrcnext-plugins/vrcnext-plugin-system).
+The loopback-only native companion of
+[the VRCNext plugin system](https://github.com/vrcnext-plugins/vrcnext-plugin-system). It is
+mandatory: the page runs one static bundle that the bridge compiles, and without the bridge there
+is no install, no state and no build.
 
-VRCNext's page can only speak HTTP and WebSockets. It cannot open a UDP socket, connect to D-Bus,
-or reach a unix socket — so anything a plugin wants that needs one of those has to happen in a
-native process. This is that process.
+VRCNext's page can only speak HTTP and WebSockets. It cannot clone a repository, run a compiler,
+keep a file, open a UDP socket or connect to D-Bus — so all of that happens here.
 
 ```
-plugin  ──WebSocket──▶  vrcnext-bridge  ──UDP──────▶  WayVR / XSOverlay-protocol overlay
-                              │
-                              └────────D-Bus──────▶  the desktop's notification daemon
+page  ──WebSocket──▶  vrcnext-bridge  ──gix (pure Rust, HTTPS)──▶  plugin repositories
+                            │
+                            ├── spawns bin/esbuild ─────────────▶  <VRCNext config>/custom-themes/
+                            │      (checksum-verified, fixed args)     vrcnext-plugin-system/vrcnext-plugin-host.js
+                            ├── state.json
+                            ├──UDP───────────────────────────────▶  WayVR / XSOverlay-protocol overlay
+                            └──D-Bus──────────────────────────────▶  the desktop's notification daemon
 ```
 
-**It is not a notification daemon.** It is a registry of *services*, each with named methods,
-reachable two ways:
+**It is a registry of *services***, each with named methods, reachable two ways:
 
 ```
 WS   /v1/ws                     one persistent socket — what the plugin system uses
 POST /v1/<service>/<method>     one call — for curl and anything else that is not the page
 ```
 
-`notify` is the first service. A future OSC, clipboard or presence service registers beside it
-without touching the transport, the request guard, the rate limiter, or the wiring.
+| Service | Does |
+| :--- | :--- |
+| `plugins` | install / list / check_updates / update / uninstall / build — clones with `gix`, validates, compiles the bundle |
+| `state` | the page's key-value store (`state.json`): enabled flags, grants, plugin settings |
+| `notify` | notifications to VR overlays and the desktop, individually targetable |
+| `logs` | appends the page's log lines to a file |
+
+A future OSC, clipboard or presence service registers beside them without touching the
+transport, the request guard, the rate limiter, or the wiring.
 
 ## The socket
 
@@ -51,14 +62,91 @@ guessing is slow. After `welcome`:
 // page → bridge: a batch of plugin log lines for the log file. Never answered.
 { "type": "logs", "records": [{ "level": "info", "scope": "my-plugin", "message": "…", "ts": 0 }] }
 
-// bridge → page: the daemon's own log lines, and protocol errors that had no id to answer under.
+// bridge → page: unsolicited events. `log` is a daemon log line; `error` a protocol error that
+// had no id to answer under; `progress`, `plugins` and `build` come from the plugins service.
 { "type": "push", "event": "log", "data": { "level": "warn", "scope": "bridge", "message": "…", "ts": 0 } }
 { "type": "push", "event": "error", "data": { "code": "bad_request", "message": "…" } }
+{ "type": "push", "event": "progress", "data": { "op": "install", "id": "friend-alerts", "step": "policy", "message": "scanning sources" } }
+{ "type": "push", "event": "plugins", "data": { "plugins": [ /* list entries */ ] } }
+{ "type": "push", "event": "build", "data": { "ok": true, "durationMs": 64, "plugins": ["friend-alerts"], "errors": [] } }
 ```
 
 `id` is caller-chosen, up to 128 characters. Service and method names are lowercase identifiers
 of up to 64 characters. A request over the socket draws from the same rate-limit bucket as an HTTP
 call, so switching transports buys nothing; log frames have their own, far larger, budget.
+
+## Plugins
+
+`plugins/install {url}` runs one pipeline, always in this order, and pushes a `progress` frame
+at each step (`awaiting_confirmation`, `clone`, `validate`, `policy`, `move`, `build`):
+
+1. **Confirm natively.** A prompt outside the page — see [Security](#security). No yes, no install.
+2. **Clone** with `gix`: HTTPS only, depth 1, default branch, into `plugins/.tmp-<random>`,
+   120 s deadline. No shell and no system `git`, ever.
+3. **Validate `plugin.json`**: id `[a-z0-9][a-z0-9-]{1,39}`, semver `version`, a semver range
+   `apiVersion`, `description` ≤ 200 characters, ≤ 8 `tags`, permissions from the fixed
+   vocabulary, exact `actions` / `events` / `hosts` (no wildcards), no unknown fields.
+4. **Scan the source policy** — every `.ts`/`.tsx`/`.js`/`.jsx` (and `.mts`/`.cts`/`.mjs`/`.cjs`)
+   file, ≤ 200 files and ≤ 2 MiB in total, no symlinks. One hit refuses the install with
+   `file:line rule`. The rules, in `crates/vrcnext-bridge-plugins/src/policy.rs`, each with a
+   unit test: `eval(`, `new Function`, `globalThis.`, `window.` (no exceptions, not even
+   `window.location.href`), `document.cookie`, `localStorage`, `sessionStorage`, `indexedDB`,
+   `XMLHttpRequest`, bare `fetch(` (`ctx.http.fetch(` is fine), `WebSocket(`, dynamic `import(`,
+   `<script`, `.innerHTML =`, `insertAdjacentHTML`, `setTimeout(` with a string first argument,
+   `require(`, `process.`. Plugins reach the world only through `ctx.*`. This is a text scan
+   that makes honest mistakes visible; it is not a sandbox and does not claim to be.
+5. **Move** the clone to `plugins/<id>` (refused if it exists), record
+   `{url, commit, installedAt, updatedAt}` in the state store's reserved `bridge.plugins`
+   namespace, push `plugins` with the new list, and **build**.
+
+Errors are `bad_request` with a stable code as the message prefix: `not_https`, `denied`,
+`approval_unavailable`, `clone_failed`, `no_manifest`, `manifest_invalid: …`,
+`policy: file:line rule`, `already_installed`, `not_installed`, `invalid_id`.
+
+`update {id}` runs the same pipeline against the recorded URL and swaps the fresh clone in only
+once it has passed, so an update that fails validation leaves the old tree exactly as it was —
+and there is never a merge. `check_updates {}` fetches each clone's origin and returns
+`{updates:[{id, current, latest, commitsBehind, changelog:[{commit, summary, time}]}]}` for the
+ones behind (≤ 50 changelog entries; a clone is shallow, so `commitsBehind` is "at least" when
+it reaches 50). `uninstall {id}` removes the clone, its record and its `plugin:<id>` state, and
+rebuilds. `list {}` returns
+`{plugins:[{id, name, version, description, url, commit, tags, permissions, optionalPermissions,
+actions, events, hosts, author?, homepage?, apiVersion, installedAt, updatedAt}]}` read from the
+clones. `build {}` forces a rebuild and returns the same report the `build` push carries.
+
+### The build
+
+The bridge produces the theme file VRCNext loads,
+`<VRCNext config>/custom-themes/vrcnext-plugin-system/vrcnext-plugin-host.js`, which contains the
+host and every installed plugin. Each build:
+
+1. Verifies `bin/esbuild`'s SHA-256 against `bin/esbuild.sha256` and refuses to run it otherwise.
+2. Writes `build/static-plugins.ts`, the import table:
+   ```ts
+   import p0 from '../plugins/friend-alerts/main.ts';
+   import m0 from '../plugins/friend-alerts/plugin.json';
+   export const COMPILED_PLUGINS = [{ manifest: m0, plugin: p0 }] as const;
+   ```
+3. Spawns `esbuild host/packages/host/src/index.ts --bundle --format=iife --target=es2022
+   --platform=browser --minify --sourcemap=linked
+   --alias:@vrcnext/plugin-api=./host/packages/api/src/index.ts
+   --alias:@vrcnext/static-plugins=./build/static-plugins.ts --outfile=<staging>
+   --log-level=warning --color=false` with the data directory as working directory, an empty
+   environment, captured output and a 60 s deadline.
+4. Writes the theme's `info.json`, then renames the staged bundle and map into place. A failed
+   build leaves the previous bundle untouched.
+5. Pushes `build {ok, durationMs, plugins, errors}`.
+
+`host/` must be self-contained: the api and host sources plus any npm package they import (under
+`host/node_modules`), since the bridge has no package manager.
+
+## State
+
+`state {get|set|delete|list}` over `~/.vrcnext-plugins/state.json`, written whole and atomically
+under one lock. `ns` and `key` are `[a-zA-Z0-9_.:-]{1,64}`; a value is ≤ 64 KiB serialised; the
+file ≤ 8 MiB. `get` answers `{value}` (`null` when absent), `list` answers `{entries:{key:value}}`.
+Namespaces starting with `bridge.` are the bridge's own and are refused over the service. The
+host uses `host` and `plugin:<id>`.
 
 ## Targeting
 
@@ -125,6 +213,8 @@ Honest accounting, because this was reverse-engineered rather than read from a s
 | `GET` | `/v1/health` | liveness, version, service names — how the plugin system tells "running" from "not installed". **No token needed**: it is the probe. |
 | `GET` | `/v1/describe` | every service, method and target, with health. Bearer required. |
 | `GET` | `/v1/ws` | the WebSocket upgrade; the token goes in the first frame |
+| `POST` | `/v1/plugins/{install,list,check_updates,update,uninstall,build}` | see [Plugins](#plugins) |
+| `POST` | `/v1/state/{get,set,delete,list}` | see [State](#state) |
 | `POST` | `/v1/notify/send` | deliver a notification |
 | `POST` | `/v1/notify/targets` | targets and the fields each honours |
 | `POST` | `/v1/logs/write` | append a batch of plugin log lines to the log file |
@@ -162,9 +252,26 @@ What is done about it:
   everything against a page or a process that does not.
 - **Loopback only, with no override flag.** `--listen` refuses a non-loopback address. There is
   deliberately no way to force it; such a flag would exist only to be misused.
-- **No sink may ever execute a program, open a shell, or write to a caller-chosen path.** This is
-  the invariant that keeps class (2) harmless. A localhost daemon that can run commands is a
-  remote-code-execution gadget for anything that gets past the guard.
+- **Privileged operations are confirmed natively, outside the page.** Installing, updating or
+  uninstalling a plugin puts code into the page, and the page cannot be the thing that confirms
+  that: any script already running there — a plugin included — could click its own dialog. So the
+  bridge asks through something the page cannot reach: on unix a desktop notification with
+  **Confirm** and **Deny** buttons (`org.freedesktop.Notifications`, critical urgency so it does
+  not expire on its own), on Windows a topmost Yes/No message box. Dismissing the prompt, a
+  120 s silence, a broken session bus or no prompt at all are all a refusal; the service answers
+  `denied` or `approval_unavailable` and logs why. "Update all" is one prompt per plugin. `build`
+  and `state` do not prompt — they put nothing new into the page.
+- **No service may execute a program, open a shell, or write to a caller-chosen path — with one
+  exception, in one place.** The build module spawns exactly one binary, `bin/esbuild`, only
+  after its SHA-256 matches the checksum the installer wrote beside it, with a fixed argument
+  list and a cleared environment. The only caller-derived input is the list of plugin ids, and
+  those are regex-validated and appear in a generated file, never on the command line. Nothing
+  from a plugin, a manifest or a request reaches argv. Every other module keeps the rule: a
+  localhost daemon that can run commands is a remote-code-execution gadget for anything that
+  gets past the guard.
+- **Nothing caller-supplied becomes a path without validation.** Every location comes from one
+  `Paths` struct; the only thing it joins is a `PluginId`, which cannot be constructed without
+  passing the id rule. Symlinks inside a clone refuse the install.
 - **Everything is bounded.** Body size, string lengths (in characters, not bytes), float finiteness
   and ranges, sink-name lengths, path-segment shape. A `Notification` can only be constructed by
   validation, so sinks never handle an unchecked value.
@@ -180,7 +287,10 @@ What is done about it:
 
 ## Install
 
-Requires a Rust toolchain. No system headers — every dependency is pure Rust.
+Requires a Rust toolchain. No system headers: git is `gix` over a rustls transport, and the only
+C in the tree is the TLS crypto backend (`aws-lc-rs`), which builds with the platform's own
+compiler. The installer in the plugin-system repository fetches the release binary, the pinned
+`esbuild` and the host sources, and lays out `~/.vrcnext-plugins` (see [Layout](#layout)).
 
 ```bash
 git clone https://github.com/vrcnext-plugins/vrcnext-bridge
@@ -206,7 +316,9 @@ transport (`udp`): sink names are the vocabulary plugins use to target things, s
 
 **A whole new capability** — implement `Service` in `vrcnext-bridge-core` and register it in the
 same place. The transport, guard and rate limiter already handle it; they know nothing about what
-any service does.
+any service does. A service that has news for the page takes an `Arc<dyn Pusher>` at construction
+and calls `push(event, data)`; the transport fans it out to every socket. A service that does
+something privileged takes an `Arc<dyn Approver>` and asks before acting.
 
 Either way the gate is `./scripts/build.sh`, which runs fmt, clippy, tests, docs and a release
 build, in that order, with nothing filtered.
@@ -215,9 +327,27 @@ build, in that order, with nothing filtered.
 
 | Crate | Contains |
 | :--- | :--- |
-| `vrcnext-bridge-core` | protocol, validation, `Service` and `Sink` traits, dispatch, rate limiter. **No I/O**, so it tests without a bus or a socket. |
-| `vrcnext-bridge-sinks` | the concrete `wayvr` and `freedesktop` sinks. |
+| `vrcnext-bridge-core` | protocol, validation, the `Service`, `Sink`, `Pusher` and `Approver` traits, `Paths`, dispatch, rate limiter. **No I/O**, so it tests without a bus or a socket. |
+| `vrcnext-bridge-plugins` | `state`, `plugins`, the manifest schema, the source policy, `gix` and the build. Git and the builder are traits, so the pipeline is tested with fakes; `tests/live_git.rs` (ignored) clones for real. |
+| `vrcnext-bridge-sinks` | the `wayvr` sink; on unix also the `freedesktop` sink and the notification-based confirmation prompt. |
+| `vrcnext-bridge-win` | the Windows message-box prompt: the one FFI call, in a crate that denies rather than forbids `unsafe` so the rest of the workspace can keep forbidding it. Empty elsewhere. |
 | `vrcnext-bridge` | the binary: the `tokio`/`axum` transport, the WebSocket session, the request guard, configuration, wiring. |
+
+On disk:
+
+```
+~/.vrcnext-plugins/                     (Windows: %LOCALAPPDATA%\vrcnext-plugins\)
+  bin/vrcnext-bridge[.exe]              installed by the installer
+  bin/esbuild[.exe]  bin/esbuild.sha256 pinned binary + the checksum verified before every spawn
+  host/                                 host + api sources (packages/api/src, packages/host/src)
+  plugins/<id>/                         one git clone per plugin: plugin.json + main.ts at the root
+  build/static-plugins.ts               generated import table
+  state.json                            the state store
+  token                                 pairing token, 0600
+```
+
+The bundle goes to `~/.config/VRCNext/custom-themes/vrcnext-plugin-system/` (`%APPDATA%\VRCNext`
+on Windows), beside an `info.json` and the source map.
 
 ## Licence
 
