@@ -22,6 +22,23 @@ pub const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 /// them, and a rule that only looked at `.ts` would be bypassed by renaming a file.
 const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
+/// Tooling configs at the repository root, which the bundler never reaches and this daemon
+/// never executes.
+///
+/// They are exempt because their whole job is to *name* the things the rules below ban: a lint
+/// config that forbids `localStorage` has to write the word down, and refusing the file that
+/// enforces the policy would be absurd. The exemption is narrow — exact names, root only — and
+/// [`imports_exempt_file`] refuses any source that imports one, so nothing can be smuggled into
+/// the bundle through a name on this list.
+const EXEMPT_ROOT_FILES: &[&str] = &[
+    "eslint.config.js",
+    "eslint.config.mjs",
+    "eslint.config.cjs",
+    "vitest.config.ts",
+    "vitest.config.js",
+    "vitest.config.mts",
+];
+
 /// How a rule is matched.
 #[derive(Debug, Clone, Copy)]
 enum Match {
@@ -120,7 +137,18 @@ pub fn scan_tree(root: &Path) -> Result<(), PolicyError> {
         if total > MAX_SOURCE_BYTES {
             return Err(PolicyError::TooLarge);
         }
-        scan_source(&relative, &String::from_utf8_lossy(&bytes))?;
+        let text = String::from_utf8_lossy(&bytes);
+        if let Some(name) = imports_exempt_file(&text) {
+            return Err(PolicyError::Violation {
+                file: relative.clone(),
+                line: text
+                    .lines()
+                    .position(|line| line.contains(name))
+                    .map_or(1, |index| index + 1),
+                rule: "references a tooling config",
+            });
+        }
+        scan_source(&relative, &text)?;
     }
     Ok(())
 }
@@ -152,6 +180,9 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Policy
             }
             collect(root, &path, out)?;
         } else if is_source(&path) {
+            if dir == root && is_exempt(&path) {
+                continue;
+            }
             out.push(path);
         }
     }
@@ -162,6 +193,21 @@ fn is_source(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| SOURCE_EXTENSIONS.contains(&ext))
+}
+
+/// Whether this is one of the root tooling configs the scan skips.
+fn is_exempt(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| EXEMPT_ROOT_FILES.contains(&name))
+}
+
+/// Whether `text` imports one of the exempt files, which would pull it into the bundle unscanned.
+fn imports_exempt_file(text: &str) -> Option<&'static str> {
+    EXEMPT_ROOT_FILES
+        .iter()
+        .copied()
+        .find(|name| text.contains(name))
 }
 
 /// Scan one file's text.
@@ -361,6 +407,41 @@ mod tests {
     fn violations_carry_the_file_and_line() {
         let err = scan_source("src/a.ts", "ok\nok\neval(x)").unwrap_err();
         assert_eq!(err.to_string(), "src/a.ts:3 eval");
+    }
+
+    #[test]
+    fn root_tooling_configs_are_exempt_but_cannot_be_imported() {
+        let dir = scratch_dir("policy-exempt");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("main.ts"), "export default 1;").unwrap();
+        // The lint config has to name what it bans; that must not be a violation.
+        std::fs::write(
+            dir.join("eslint.config.mjs"),
+            "export default [{ rules: { 'no-restricted-globals': ['error', 'localStorage', 'eval'] } }];",
+        )
+        .unwrap();
+        scan_tree(&dir).unwrap();
+
+        // The same name one directory down is ordinary source and is scanned.
+        std::fs::write(dir.join("src/eslint.config.mjs"), "localStorage.x").unwrap();
+        assert!(matches!(
+            scan_tree(&dir).unwrap_err(),
+            PolicyError::Violation {
+                rule: "localStorage",
+                ..
+            }
+        ));
+        std::fs::remove_file(dir.join("src/eslint.config.mjs")).unwrap();
+
+        // Importing an exempt file would bundle it unscanned, so that is refused.
+        std::fs::write(dir.join("main.ts"), "import './eslint.config.mjs';").unwrap();
+        assert!(matches!(
+            scan_tree(&dir).unwrap_err(),
+            PolicyError::Violation {
+                rule: "references a tooling config",
+                ..
+            }
+        ));
     }
 
     #[test]
