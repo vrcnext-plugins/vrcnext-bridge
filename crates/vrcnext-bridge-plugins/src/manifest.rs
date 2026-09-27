@@ -23,6 +23,7 @@ pub const PERMISSIONS: &[&str] = &[
     "native",
     "osc",
     "gamelog",
+    "vrchat",
     "context-menu",
     "routes",
     "clipboard",
