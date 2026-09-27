@@ -8,7 +8,9 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use vrcnext_bridge_core::logs::{LogService, LogWriter, NullLogWriter};
 use vrcnext_bridge_core::notify::{NotifyService, SinkSet};
-use vrcnext_bridge_core::{Approver, NullApprover, Paths, Pusher, Service, ServiceRegistry};
+use vrcnext_bridge_core::{
+    Approver, NullApprover, Paths, Pusher, RemoteService, Service, ServiceRegistry,
+};
 use vrcnext_bridge_plugins::{
     Builder, EsbuildBuilder, Git, GixGit, PluginsService, StateService, StateStore,
 };
@@ -46,11 +48,14 @@ pub(crate) fn build_services(
             builder as Arc<dyn Builder>,
             Arc::clone(&state),
         ),
-        pusher,
+        Arc::clone(&pusher),
         approver,
     );
 
     let mut registry = ServiceRegistry::new();
+    if config.remote {
+        registry.register(Arc::new(RemoteService::new(pusher)) as Arc<dyn Service>);
+    }
     registry.register(Arc::new(NotifyService::new(build_sinks(config))) as Arc<dyn Service>);
     registry.register(Arc::new(LogService::new(Arc::clone(&log_writer))) as Arc<dyn Service>);
     registry.register(Arc::new(StateService::new(state)) as Arc<dyn Service>);
@@ -170,6 +175,10 @@ pub(crate) fn log_banner(config: &Config, paths: &Paths, token: &str, services: 
         .and_then(serde_json::Value::as_str)
     {
         log::info!("plugin logs: {logs}");
+    }
+
+    if config.remote {
+        log::warn!("remote control: enabled; the pairing token can run code in the page");
     }
 
     if config.allow_origins.is_empty() {

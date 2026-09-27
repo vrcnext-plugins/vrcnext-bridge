@@ -50,6 +50,7 @@ pub mod notify;
 pub mod paths;
 pub mod pusher;
 pub mod ratelimit;
+pub mod remote;
 pub mod service;
 
 pub use approve::{APPROVAL_DEADLINE_SECS, Approval, ApprovalRequest, Approver, NullApprover};
@@ -62,4 +63,5 @@ pub use notify::{
 pub use paths::{Paths, PluginId};
 pub use pusher::{NullPusher, Pusher, RecordingPusher};
 pub use ratelimit::RateLimiter;
+pub use remote::RemoteService;
 pub use service::{Service, ServiceError, ServiceRegistry};

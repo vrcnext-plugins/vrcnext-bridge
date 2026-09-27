@@ -219,6 +219,7 @@ Honest accounting, because this was reverse-engineered rather than read from a s
 | `POST` | `/v1/notify/targets` | targets and the fields each honours |
 | `POST` | `/v1/logs/write` | append a batch of plugin log lines to the log file |
 | `POST` | `/v1/logs/info` | where that file is and how big it has grown |
+| `POST` | `/v1/remote/eval` | run a snippet inside the paired page and return its result. Only with `--remote`; see [Remote control](docs/running.md#remote-control) |
 
 ## Security
 

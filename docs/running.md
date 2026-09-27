@@ -92,6 +92,7 @@ curl -s http://127.0.0.1:42081/v1/health
 | `--rate` / `--burst` | `5` / `10` | Token bucket, shared by HTTP calls and socket requests. |
 | `--threads` | `4` | Runtime worker threads. Services run on a separate blocking pool. |
 | `--log` | `info` | `debug` logs every delivery. |
+| `--remote` | off | Offer `remote/eval`: run snippets inside the page. See [Remote control](#remote-control). |
 
 Each also reads an environment variable — see `vrcnext-bridge --help`.
 
@@ -102,6 +103,35 @@ The host looks at `http://127.0.0.1:42081`, probes `/v1/health` at boot, and kee
 **Plugins** shows one of four states — not detected, running but not connected, unpaired (the
 token was refused; paste it again), connected — and has a **Re-check** button for after you have
 just started it.
+
+## Remote control
+
+Started with `--remote`, the bridge offers one more service: `POST /v1/remote/eval` takes
+`{ "code": "…", "timeoutMs": 10000 }`, pushes the snippet to the paired page over the socket, and
+answers with whatever the page returned. It exists so that a script or an agent can inspect and
+drive VRCNext — open a tab, read a card, click a button, check a layout — without a synthetic
+mouse and without taking the pointer from whoever is at the desk.
+
+The snippet is the body of an `async` function. `host` (the plugin host's handle, with `manager`)
+and a few helpers are in scope: `text(selector)`, `click(selector)`, `visible(selector)`,
+`rects(selector)` and `sleep(ms)`. Everything else the page has — `showTab`, `document`, VRCNext's
+own globals — is there as usual.
+
+```bash
+scripts/remote-eval.sh 'showTab(9); await sleep(300); return text("#tab9 .settings-nav")'
+scripts/remote-eval.sh 'return rects("#vrcnextPluginsNavGroup ~ .panel-card")'
+```
+
+The reply is `{ "ok": true, "value": … }` for a value, `{ "ok": false, "error": "…" }` when the
+snippet threw, and a `503 unavailable` when no page answered before the deadline (default ten
+seconds, at most sixty). Values are JSON; anything that will not serialise comes back as its
+string form, and anything over 512 KiB is truncated.
+
+It is off by default on purpose. Whoever holds the pairing token can already install plugins
+and read state, and the page runs the bundle this daemon compiles, so the service does not add a
+new party to trust — but it turns that trust into "run anything in the app", so it has to be
+asked for and the startup banner says when it is on. Keep the token file private; do not add
+`--allow-origin` alongside it.
 
 ## Troubleshooting
 

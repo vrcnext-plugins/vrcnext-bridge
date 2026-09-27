@@ -25,6 +25,10 @@ pub(crate) enum SinkChoice {
 /// installs and compiles plugins, keeps the page's state, and delivers notifications.
 #[derive(Debug, Parser)]
 #[command(name = "vrcnext-bridge", version, about, long_about = None)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one independent command-line switch; a state machine would hide that"
+)]
 pub(crate) struct Config {
     /// Address to listen on. Must be loopback.
     #[arg(long, default_value = DEFAULT_LISTEN, env = "VRCNEXT_BRIDGE_LISTEN")]
@@ -86,6 +90,15 @@ pub(crate) struct Config {
     /// Accept no plugin logs at all.
     #[arg(long)]
     pub(crate) no_log_capture: bool,
+
+    /// Offer the `remote` service: `POST /v1/remote/eval` runs a snippet inside the paired
+    /// VRCNext page and returns its result.
+    ///
+    /// Off by default. Anyone holding the pairing token can then drive the app directly, which
+    /// is the point — a script or an agent can inspect and operate the page without touching the
+    /// desktop's pointer — but it is also why it has to be asked for.
+    #[arg(long, env = "VRCNEXT_BRIDGE_REMOTE")]
+    pub(crate) remote: bool,
 
     /// Log level: error, warn, info, debug, trace.
     #[arg(long, default_value = "info", env = "VRCNEXT_BRIDGE_LOG")]
