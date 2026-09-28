@@ -27,7 +27,7 @@ POST /v1/<service>/<method>     one call — for curl and anything else that is 
 
 | Service | Does |
 | :--- | :--- |
-| `plugins` | install / list / check_updates / update / uninstall / build — clones with `gix`, validates, compiles the bundle |
+| `plugins` | install / list / check_updates / update / uninstall / build / keys / forget_key — clones with `gix`, validates, verifies the author's signature, compiles the bundle |
 | `state` | the page's key-value store (`state.json`): enabled flags, grants, plugin settings |
 | `notify` | notifications to VR overlays and the desktop, individually targetable |
 | `logs` | appends the page's log lines to a file |
@@ -78,7 +78,8 @@ call, so switching transports buys nothing; log frames have their own, far large
 ## Plugins
 
 `plugins/install {url}` runs one pipeline, always in this order, and pushes a `progress` frame
-at each step (`awaiting_confirmation`, `clone`, `validate`, `policy`, `move`, `build`):
+at each step (`awaiting_confirmation`, `clone`, `validate`, `policy`, `signature`, `move`,
+`build`):
 
 1. **Confirm natively.** A prompt outside the page — see [Security](#security). No yes, no install.
 2. **Clone** with `gix`: HTTPS only, depth 1, default branch, into `plugins/.tmp-<random>`,
@@ -95,13 +96,23 @@ at each step (`awaiting_confirmation`, `clone`, `validate`, `policy`, `move`, `b
    `<script`, `.innerHTML =`, `insertAdjacentHTML`, `setTimeout(` with a string first argument,
    `require(`, `process.`. Plugins reach the world only through `ctx.*`. This is a text scan
    that makes honest mistakes visible; it is not a sandbox and does not claim to be.
-5. **Move** the clone to `plugins/<id>` (refused if it exists), record
-   `{url, commit, installedAt, updatedAt}` in the state store's reserved `bridge.plugins`
+5. **Verify the signature.** `plugin.sig` at the root must be an Ed25519 signature, version 1,
+   naming this plugin's id, over a SHA-256 digest of every file in the clone except `.git/` and
+   itself. Then the key has to be one the user has accepted: an unknown fingerprint is a second
+   native prompt, and an update signed by a key other than the one the plugin is recorded under
+   is a third, separate prompt, every time. Accepted keys live in the reserved
+   `bridge.plugin-keys` namespace; `keys {}` lists them and `forget_key {keyId}` removes one
+   (confirmed natively, and nothing is uninstalled). The format and the author's side of it are
+   in `crates/vrcnext-bridge-plugins/src/signing.rs` and the plugin system's
+   `scripts/sign-plugin.mjs`.
+6. **Move** the clone to `plugins/<id>` (refused if it exists), record
+   `{url, commit, keyId, installedAt, updatedAt}` in the state store's reserved `bridge.plugins`
    namespace, push `plugins` with the new list, and **build**.
 
 Errors are `bad_request` with a stable code as the message prefix: `not_https`, `denied`,
 `approval_unavailable`, `clone_failed`, `no_manifest`, `manifest_invalid: …`,
-`policy: file:line rule`, `already_installed`, `not_installed`, `invalid_id`.
+`policy: file:line rule`, `unsigned: …`, `already_installed`, `not_installed`, `not_trusted`,
+`invalid_id`.
 
 `update {id}` runs the same pipeline against the recorded URL and swaps the fresh clone in only
 once it has passed, so an update that fails validation leaves the old tree exactly as it was —
@@ -111,7 +122,7 @@ ones behind (≤ 50 changelog entries; a clone is shallow, so `commitsBehind` is
 it reaches 50). `uninstall {id}` removes the clone, its record and its `plugin:<id>` state, and
 rebuilds. `list {}` returns
 `{plugins:[{id, name, version, description, url, commit, tags, permissions, optionalPermissions,
-actions, events, hosts, author?, homepage?, apiVersion, installedAt, updatedAt}]}` read from the
+actions, events, hosts, author?, homepage?, apiVersion, installedAt, updatedAt, keyId}]}` read from the
 clones. `build {}` forces a rebuild and returns the same report the `build` push carries.
 
 ### The build
@@ -213,7 +224,7 @@ Honest accounting, because this was reverse-engineered rather than read from a s
 | `GET` | `/v1/health` | liveness, version, service names — how the plugin system tells "running" from "not installed". **No token needed**: it is the probe. |
 | `GET` | `/v1/describe` | every service, method and target, with health. Bearer required. |
 | `GET` | `/v1/ws` | the WebSocket upgrade; the token goes in the first frame |
-| `POST` | `/v1/plugins/{install,list,check_updates,update,uninstall,build}` | see [Plugins](#plugins) |
+| `POST` | `/v1/plugins/{install,list,check_updates,update,uninstall,build,keys,forget_key}` | see [Plugins](#plugins) |
 | `POST` | `/v1/state/{get,set,delete,list}` | see [State](#state) |
 | `POST` | `/v1/notify/send` | deliver a notification |
 | `POST` | `/v1/notify/targets` | targets and the fields each honours |
@@ -262,6 +273,15 @@ What is done about it:
   120 s silence, a broken session bus or no prompt at all are all a refusal; the service answers
   `denied` or `approval_unavailable` and logs why. "Update all" is one prompt per plugin. `build`
   and `state` do not prompt — they put nothing new into the page.
+- **Code only arrives from a key the user accepted.** A confirmation says yes to a URL, and a
+  URL is not an identity — a repository changes hands and an account takeover rewrites every
+  branch at once. So every tree also has to carry an Ed25519 signature over its own files, bound
+  to its plugin id, and each plugin is pinned to the key it was installed under. A new key is
+  confirmed once; a *changed* key is confirmed every time, separately, and being a trusted
+  author of another plugin is not an excuse. Verification is offline and in-process: no key
+  server, no registry, nothing fetched. What this buys is narrow and worth stating plainly — it
+  says who published a tree, not that the tree is safe, and a fingerprint the user never
+  compared against the author is trust on first use.
 - **No service may execute a program, open a shell, or write to a caller-chosen path — with one
   exception, in one place.** The build module spawns exactly one binary, `bin/esbuild`, only
   after its SHA-256 matches the checksum the installer wrote beside it, with a fixed argument
@@ -329,7 +349,7 @@ build, in that order, with nothing filtered.
 | Crate | Contains |
 | :--- | :--- |
 | `vrcnext-bridge-core` | protocol, validation, the `Service`, `Sink`, `Pusher` and `Approver` traits, `Paths`, dispatch, rate limiter. **No I/O**, so it tests without a bus or a socket. |
-| `vrcnext-bridge-plugins` | `state`, `plugins`, the manifest schema, the source policy, `gix` and the build. Git and the builder are traits, so the pipeline is tested with fakes; `tests/live_git.rs` (ignored) clones for real. |
+| `vrcnext-bridge-plugins` | `state`, `plugins`, the manifest schema, the source policy, signature verification and the trust store, `gix` and the build. Git and the builder are traits, so the pipeline is tested with fakes; `tests/live_git.rs` (ignored) clones for real. |
 | `vrcnext-bridge-sinks` | the `wayvr` sink; on unix also the `freedesktop` sink and the notification-based confirmation prompt. |
 | `vrcnext-bridge-win` | the Windows message-box prompt: the one FFI call, in a crate that denies rather than forbids `unsafe` so the rest of the workspace can keep forbidding it. Empty elsewhere. |
 | `vrcnext-bridge` | the binary: the `tokio`/`axum` transport, the WebSocket session, the request guard, configuration, wiring. |

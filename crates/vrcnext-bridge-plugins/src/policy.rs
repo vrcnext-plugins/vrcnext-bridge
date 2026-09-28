@@ -39,6 +39,14 @@ const EXEMPT_ROOT_FILES: &[&str] = &[
     "vitest.config.mts",
 ];
 
+/// Exempt files that are not at the root, by exact relative path.
+///
+/// One entry, for the same reason as [`EXEMPT_ROOT_FILES`] and with the same narrowness: the
+/// signing tool every plugin repository carries runs under Node at release time, never in the
+/// page, and it has to say `process` and `Buffer` to do its job. It is never imported — nothing
+/// in a bundle could use it — and [`imports_exempt_file`] refuses any source that names it.
+const EXEMPT_PATHS: &[&str] = &["scripts/sign-plugin.mjs"];
+
 /// How a rule is matched.
 #[derive(Debug, Clone, Copy)]
 enum Match {
@@ -180,7 +188,7 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Policy
             }
             collect(root, &path, out)?;
         } else if is_source(&path) {
-            if dir == root && is_exempt(&path) {
+            if (dir == root && is_exempt(&path)) || is_exempt_path(root, &path) {
                 continue;
             }
             out.push(path);
@@ -202,10 +210,21 @@ fn is_exempt(path: &Path) -> bool {
         .is_some_and(|name| EXEMPT_ROOT_FILES.contains(&name))
 }
 
+/// Whether this is one of the exempt files below the root, by exact relative path.
+fn is_exempt_path(root: &Path, path: &Path) -> bool {
+    let relative = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    EXEMPT_PATHS.contains(&relative.as_str())
+}
+
 /// Whether `text` imports one of the exempt files, which would pull it into the bundle unscanned.
 fn imports_exempt_file(text: &str) -> Option<&'static str> {
     EXEMPT_ROOT_FILES
         .iter()
+        .chain(EXEMPT_PATHS)
         .copied()
         .find(|name| text.contains(name))
 }
@@ -435,6 +454,40 @@ mod tests {
 
         // Importing an exempt file would bundle it unscanned, so that is refused.
         std::fs::write(dir.join("main.ts"), "import './eslint.config.mjs';").unwrap();
+        assert!(matches!(
+            scan_tree(&dir).unwrap_err(),
+            PolicyError::Violation {
+                rule: "references a tooling config",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_signing_tool_is_exempt_at_its_one_path_and_nowhere_else() {
+        let dir = scratch_dir("policy-signer");
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::write(dir.join("main.ts"), "export default 1;").unwrap();
+        // It runs under Node at release time and has to name `process`; the page never sees it.
+        std::fs::write(
+            dir.join("scripts/sign-plugin.mjs"),
+            "process.stdout.write(Buffer.from('x').toString('hex'));",
+        )
+        .unwrap();
+        scan_tree(&dir).unwrap();
+
+        // Any other file under scripts/ is ordinary source.
+        std::fs::write(dir.join("scripts/other.mjs"), "process.exit(0)").unwrap();
+        let error = scan_tree(&dir).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "scripts/other.mjs:1 process",
+            "{error:?}"
+        );
+        std::fs::remove_file(dir.join("scripts/other.mjs")).unwrap();
+
+        // And importing the signer is refused, so it cannot be smuggled into the bundle.
+        std::fs::write(dir.join("main.ts"), "import './scripts/sign-plugin.mjs';").unwrap();
         assert!(matches!(
             scan_tree(&dir).unwrap_err(),
             PolicyError::Violation {

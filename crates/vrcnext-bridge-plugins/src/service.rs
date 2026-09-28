@@ -2,11 +2,17 @@
 //!
 //! The pipeline for anything that brings code in is always the same and always in this order:
 //! confirm natively → clone into a temporary directory → read and validate `plugin.json` → scan
-//! the source policy → move into place → record → rebuild. Validation happens on the temporary
+//! the source policy → verify the author's signature → move into place → record → rebuild. Validation happens on the temporary
 //! copy, so a plugin that fails never has a directory under `plugins/` and never reaches the
 //! import table. An update is the same pipeline with a swap at the end: the fresh clone replaces
 //! the old tree only once it has passed, which is what "leave the old tree if invalid" means in
 //! practice and also what makes "no merges, ever" trivially true.
+//!
+//! Signatures add a second question the pipeline has to answer, and it is not "is the signature
+//! valid" — [`crate::signing`] settles that on its own — but "is this the key this plugin has
+//! always had". An unknown key is confirmed once, natively, and remembered in [`crate::trust`];
+//! a key that differs from the one the plugin was installed under is confirmed *every* time,
+//! separately, because that is what an account takeover looks like from here.
 //!
 //! One mutex serialises everything that changes the installed set or runs a build. Reads
 //! (`list`, `check_updates`) do not take it.
@@ -26,7 +32,9 @@ use crate::build::{BuildReport, Builder};
 use crate::git::Git;
 use crate::manifest::Manifest;
 use crate::policy;
+use crate::signing::{self, VerifiedSignature};
 use crate::state::StateStore;
+use crate::trust::TrustStore;
 
 /// The state namespace that holds one record per installed plugin.
 pub const RECORDS_NS: &str = "bridge.plugins";
@@ -49,6 +57,9 @@ pub struct ListEntry {
     pub installed_at: u64,
     /// Milliseconds since the epoch; equals `installedAt` until the first update.
     pub updated_at: u64,
+    /// Fingerprint of the key this plugin is installed under. Empty only for a plugin installed
+    /// before signatures were required, which the next update will pin.
+    pub key_id: String,
 }
 
 /// What the state store remembers per plugin.
@@ -59,6 +70,10 @@ struct Record {
     commit: String,
     installed_at: u64,
     updated_at: u64,
+    /// The signing key this plugin belongs to. `default` so records written before signatures
+    /// existed still load; an empty one is pinned by the first update that verifies.
+    #[serde(default)]
+    key_id: String,
 }
 
 /// Everything the service is built from.
@@ -85,12 +100,19 @@ struct IdParams {
     id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct KeyParams {
+    key_id: String,
+}
+
 /// A validated clone that has not been moved into place yet.
 struct Candidate {
     dir: PathBuf,
     manifest: Manifest,
     id: PluginId,
     commit: String,
+    signature: VerifiedSignature,
 }
 
 fn bad(code: &str, detail: impl std::fmt::Display) -> ServiceError {
@@ -214,6 +236,7 @@ impl PluginsService {
             commit: record.commit,
             installed_at: record.installed_at,
             updated_at: record.updated_at,
+            key_id: record.key_id,
         })
     }
 
@@ -272,11 +295,12 @@ impl PluginsService {
             .map_err(|error| bad("clone_failed", error))?;
         let result = Self::validate_candidate(&dir, op, self);
         match result {
-            Ok((manifest, id)) => Ok(Candidate {
+            Ok((manifest, id, signature)) => Ok(Candidate {
                 dir,
                 manifest,
                 id,
                 commit,
+                signature,
             }),
             Err(error) => {
                 let _ = std::fs::remove_dir_all(&dir);
@@ -289,7 +313,7 @@ impl PluginsService {
         dir: &std::path::Path,
         op: &str,
         this: &Self,
-    ) -> Result<(Manifest, PluginId), ServiceError> {
+    ) -> Result<(Manifest, PluginId, VerifiedSignature), ServiceError> {
         this.progress(op, None, "validate", "checking plugin.json");
         let bytes = std::fs::read(dir.join("plugin.json")).map_err(|_| {
             bad(
@@ -306,7 +330,135 @@ impl PluginsService {
         }
         this.progress(op, Some(&id), "policy", "scanning sources");
         policy::scan_tree(dir).map_err(|error| bad("policy", error))?;
-        Ok((manifest, id))
+        this.progress(
+            op,
+            Some(&id),
+            "signature",
+            "checking the author's signature",
+        );
+        let signature =
+            signing::verify(dir, id.as_str()).map_err(|error| bad("unsigned", error))?;
+        Ok((manifest, id, signature))
+    }
+
+    // ---- signing keys -----------------------------------------------------------------------
+
+    /// Make sure the key that signed this tree is one the user has accepted, asking once if not.
+    ///
+    /// The prompt is deliberately separate from the install prompt. "Install from this URL" and
+    /// "this key speaks for that plugin from now on" are different decisions with different
+    /// lifetimes, and folding them together would make the second one invisible.
+    fn ensure_trusted(
+        &self,
+        id: &PluginId,
+        url: &str,
+        signature: &VerifiedSignature,
+    ) -> Result<(), ServiceError> {
+        let keys = TrustStore::new(&self.state);
+        if keys.get(&signature.key_id).is_none() {
+            self.confirm(
+                "trust_key",
+                Some(id),
+                format!("Trust a new signing key for {id}?"),
+                format!(
+                    "This machine has not seen this key before.\n\nKey {}\nFrom {url}\n\n\
+                     Confirm only if that fingerprint is the one the author publishes. Anything \
+                     it signs afterwards installs without asking again.",
+                    signature.key_id
+                ),
+            )?;
+        }
+        keys.record(
+            &signature.key_id,
+            &signature.public_key,
+            &format!("{id} ({url})"),
+            id.as_str(),
+            now_ms(),
+        )
+        .map_err(|error| ServiceError::Internal(error.to_string()))
+    }
+
+    /// Ask separately when an update is signed by a key other than the one the plugin was
+    /// installed under.
+    ///
+    /// This asks every time, and being already trusted for *another* plugin is not an excuse:
+    /// trusting an author is not consenting to them taking over someone else's plugin. An empty
+    /// recorded key is a plugin installed before signatures were required, so there is nothing
+    /// to have changed and the key is simply pinned.
+    fn confirm_key_change(
+        &self,
+        id: &PluginId,
+        was: &str,
+        signature: &VerifiedSignature,
+    ) -> Result<(), ServiceError> {
+        if was.is_empty() || was == signature.key_id {
+            return Ok(());
+        }
+        self.confirm(
+            "rotate_key",
+            Some(id),
+            format!("The signing key for {id} changed"),
+            format!(
+                "Installed under {was}\nThis update is signed by {}\n\n\
+                 Either the author rotated their key, or someone else is publishing as them. \
+                 Confirm only if you can check the new fingerprint against the author.",
+                signature.key_id
+            ),
+        )
+    }
+
+    /// Every trusted key, newest use first, with the plugins currently installed under each.
+    fn keys(&self) -> Value {
+        let installed: Vec<(PluginId, String)> = self
+            .installed_ids()
+            .into_iter()
+            .filter_map(|id| self.record(&id).map(|record| (id, record.key_id)))
+            .collect();
+        let mut keys = TrustStore::new(&self.state).list();
+        keys.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.last_used_at));
+        let keys: Vec<Value> = keys
+            .into_iter()
+            .map(|(key_id, entry)| {
+                let using: Vec<String> = installed
+                    .iter()
+                    .filter(|(_, pinned)| *pinned == key_id)
+                    .map(|(id, _)| id.to_string())
+                    .collect();
+                json!({
+                    "keyId": key_id,
+                    "publicKey": entry.public_key,
+                    "label": entry.label,
+                    "trustedAt": entry.trusted_at,
+                    "lastUsedAt": entry.last_used_at,
+                    "seenFor": entry.plugins,
+                    "installed": using,
+                })
+            })
+            .collect();
+        json!({ "keys": keys })
+    }
+
+    /// Forget a trusted key. Confirmed natively, like everything else that changes what may run.
+    fn forget_key(&self, params: Value) -> Result<Value, ServiceError> {
+        let p: KeyParams = Self::parse(params)?;
+        let _guard = self.lock();
+        let keys = TrustStore::new(&self.state);
+        let entry = keys
+            .get(&p.key_id)
+            .ok_or_else(|| bad("not_trusted", &p.key_id))?;
+        self.confirm(
+            "forget_key",
+            None,
+            "Stop trusting a signing key?".to_owned(),
+            format!(
+                "Key {}\nFirst trusted for {}\n\n\
+                 Nothing is uninstalled. The next plugin this key signs will be confirmed again.",
+                p.key_id, entry.label
+            ),
+        )?;
+        keys.forget(&p.key_id)
+            .map_err(|error| ServiceError::Internal(error.to_string()))?;
+        Ok(json!({}))
     }
 
     fn install(&self, params: Value) -> Result<Value, ServiceError> {
@@ -330,6 +482,10 @@ impl PluginsService {
             let _ = std::fs::remove_dir_all(&candidate.dir);
             return Err(bad("already_installed", candidate.id));
         }
+        if let Err(error) = self.ensure_trusted(&candidate.id, &p.url, &candidate.signature) {
+            let _ = std::fs::remove_dir_all(&candidate.dir);
+            return Err(error);
+        }
         self.progress("install", Some(&candidate.id), "move", "moving into place");
         std::fs::rename(&candidate.dir, &target).map_err(|error| {
             let _ = std::fs::remove_dir_all(&candidate.dir);
@@ -343,6 +499,7 @@ impl PluginsService {
                 commit: candidate.commit,
                 installed_at: now,
                 updated_at: now,
+                key_id: candidate.signature.key_id,
             },
         )?;
         self.push_installed();
@@ -376,12 +533,9 @@ impl PluginsService {
         )?;
 
         let candidate = self.fetch_candidate("update", &record.url)?;
-        if candidate.id != id {
+        if let Err(error) = self.check_update(&id, &record, &candidate) {
             let _ = std::fs::remove_dir_all(&candidate.dir);
-            return Err(bad(
-                "manifest_invalid",
-                format!("the repository now declares id '{}'", candidate.id),
-            ));
+            return Err(error);
         }
         self.progress("update", Some(&id), "move", "swapping in the new tree");
         let target = self.paths.plugin_dir(&id);
@@ -400,6 +554,7 @@ impl PluginsService {
             &Record {
                 commit: candidate.commit,
                 updated_at: now_ms(),
+                key_id: candidate.signature.key_id,
                 ..record
             },
         )?;
@@ -407,6 +562,24 @@ impl PluginsService {
         self.progress("update", Some(&id), "build", "rebuilding the bundle");
         self.rebuild();
         self.finished(&id, &candidate.manifest.name)
+    }
+
+    /// Everything an update has to satisfy before the trees are swapped. Kept apart from
+    /// [`Self::update`] so a refusal has exactly one place to clean up the clone.
+    fn check_update(
+        &self,
+        id: &PluginId,
+        record: &Record,
+        candidate: &Candidate,
+    ) -> Result<(), ServiceError> {
+        if candidate.id != *id {
+            return Err(bad(
+                "manifest_invalid",
+                format!("the repository now declares id '{}'", candidate.id),
+            ));
+        }
+        self.confirm_key_change(id, &record.key_id, &candidate.signature)?;
+        self.ensure_trusted(id, &record.url, &candidate.signature)
     }
 
     fn uninstall(&self, params: Value) -> Result<Value, ServiceError> {
@@ -470,10 +643,14 @@ impl Service for PluginsService {
 
     fn describe(&self) -> Value {
         json!({
-            "methods": ["install", "list", "check_updates", "update", "uninstall", "build"],
+            "methods": [
+                "install", "list", "check_updates", "update", "uninstall", "build",
+                "keys", "forget_key",
+            ],
             "pluginsDir": self.paths.plugins_dir().display().to_string(),
             "bundle": self.paths.bundle().display().to_string(),
             "confirmation": self.approver.describe(),
+            "signatures": "ed25519, required",
             "installed": self.installed_ids(),
         })
     }
@@ -485,6 +662,8 @@ impl Service for PluginsService {
             "check_updates" => Ok(self.check_updates()),
             "update" => self.update(params),
             "uninstall" => self.uninstall(params),
+            "keys" => Ok(self.keys()),
+            "forget_key" => self.forget_key(params),
             "build" => {
                 let _guard = self.lock();
                 Ok(json!(self.rebuild()))

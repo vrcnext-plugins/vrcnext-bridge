@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 vrcnext-bridge-core.workspace = true
+ed25519-dalek.workspace = true
 getrandom.workspace = true
 gix.workspace = true
 log.workspace = true
