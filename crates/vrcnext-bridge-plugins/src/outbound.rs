@@ -9,7 +9,7 @@
 //! That is deliberately more reach than the page has, and it is why the host asks the user about
 //! the concrete host before every first request to it. This service does not decide who may call
 //! it: by the time a call arrives the page has already been told yes. What it does own is the
-//! shape of one request — the scheme, the size of what comes back, and how long it may take.
+//! shape of one request — the scheme, the size of what comes back, and how long it may take — and it never follows a redirect, since that would reach a host nobody approved.
 //!
 //! It is a service, not an endpoint. Like every other service it is reached over the shared
 //! WebSocket; the bridge's own HTTP interface stays as small as it is and gains nothing here.
@@ -129,6 +129,10 @@ impl HttpService {
                     // Identifies the bridge to the far end, so an operator seeing this traffic can
                     // tell what made it. The plugin may not override it.
                     .user_agent(concat!("vrcnext-bridge/", env!("CARGO_PKG_VERSION")))
+                    // A redirect is handed back as it came. Following it would send the request
+                    // to a host the user never approved, so the plugin sees the 3xx and its
+                    // `location` header, and asks again — through the host's prompt — if it wants.
+                    .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .map_err(|error| error.to_string())
             })
@@ -228,6 +232,7 @@ const fn is_token_byte(byte: u8) -> bool {
 /// Reads the response within [`MAX_RESPONSE_BYTES`], refusing anything that is not text.
 fn read_response(response: reqwest::blocking::Response) -> Result<Value, HttpError> {
     let status = response.status();
+    // Redirects are not followed, so this is the URL that was asked for.
     let final_url = response.url().to_string();
     let mut headers = Map::new();
     for (name, value) in response.headers() {
@@ -277,6 +282,7 @@ impl Service for HttpService {
             "defaultTimeoutMs": DEFAULT_TIMEOUT_MS,
             "maxTimeoutMs": MAX_TIMEOUT_MS,
             "bodies": "text",
+            "redirects": "not followed; a 3xx is returned as-is, with its location header",
             // Stated because it is the whole point and the whole risk: this reaches what the
             // machine reaches, including its own network, which the page cannot.
             "reach": "whatever this machine can reach; not limited to hosts that allow cross-origin reads",

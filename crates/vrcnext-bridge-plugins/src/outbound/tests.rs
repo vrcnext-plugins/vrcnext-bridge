@@ -133,3 +133,13 @@ fn describe_states_the_reach_it_has() {
             .is_some_and(|list| list.len() == 1)
     );
 }
+
+#[test]
+fn describe_states_that_redirects_are_not_followed() {
+    let described = HttpService::new().describe();
+    assert!(
+        described["redirects"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("not followed"))
+    );
+}
