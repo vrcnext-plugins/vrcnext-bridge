@@ -3,12 +3,12 @@
 //! The page can only reach hosts that opt into cross-origin reads. Most plain HTTP APIs do not —
 //! the Steam Web API, for one — so a plugin asking for them through `fetch` gets an opaque
 //! network failure it cannot distinguish from the server being down. The bridge is not a browser
-//! and is not bound by that rule, so a request routed through here reaches the same hosts a
-//! `curl` on this machine would.
+//! and is not bound by that rule, so a request routed through here reaches public hosts the page
+//! could not read.
 //!
 //! It does not reach this machine or its network, though: loopback, private, link-local and the
 //! other non-public ranges are refused, both as literals in the URL and as what a name resolves
-//! to (see [`is_public`]).
+//! to.
 //!
 //! That is deliberately more reach than the page has, and it is why the host asks the user about
 //! the concrete host before every first request to it. This service does not decide who may call
@@ -419,8 +419,8 @@ impl Service for HttpService {
             "maxTimeoutMs": MAX_TIMEOUT_MS,
             "bodies": "text",
             "redirects": "not followed; a 3xx is returned as-is, with its location header",
-            // Stated because it is the whole point and the whole risk: this reaches what the
-            // machine reaches, including its own network, which the page cannot.
+            // Stated because it is the whole point and the whole risk: this reads public hosts
+            // the page cannot, and it is why the non-public ranges are refused.
             "reach": "public internet hosts, not limited to hosts that allow cross-origin reads; loopback, private, link-local, CGNAT, multicast and other non-public addresses are refused, by name or by literal",
         })
     }
