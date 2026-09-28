@@ -225,12 +225,36 @@ fn is_exempt_path(root: &Path, path: &Path) -> bool {
 }
 
 /// Whether `text` imports one of the exempt files, which would pull it into the bundle unscanned.
+///
+/// Only a quoted module specifier counts. Naming an exempt file in prose has to stay allowed:
+/// the signing tool is the thing every plugin's own comments and README tell an author to run,
+/// and a policy that refused a repository for explaining itself would be absurd.
 fn imports_exempt_file(text: &str) -> Option<&'static str> {
     EXEMPT_ROOT_FILES
         .iter()
         .chain(EXEMPT_PATHS)
         .copied()
-        .find(|name| text.contains(name))
+        .find(|name| is_specifier(text, name))
+}
+
+/// Whether `name` appears in `text` as the tail of a quoted module specifier.
+///
+/// A specifier is delimited: the name ends at the closing quote, and walking left over the path
+/// characters that can precede it (`./`, `../`, directories) must arrive at the opening one.
+/// Dynamic `import(` and `require(` are refused by [`RULES`] anyway, so a static specifier is
+/// the only way an exempt file could reach the bundle.
+fn is_specifier(text: &str, name: &str) -> bool {
+    const QUOTES: [char; 3] = ['\'', '"', '`'];
+    text.match_indices(name).any(|(at, _)| {
+        let after = text[at.saturating_add(name.len())..].chars().next();
+        if !after.is_some_and(|c| QUOTES.contains(&c)) {
+            return false;
+        }
+        let before = text[..at].trim_end_matches(|c: char| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | '\\' | '-' | '_' | '@')
+        });
+        before.ends_with(QUOTES)
+    })
 }
 
 /// Scan one file's text.
@@ -492,6 +516,15 @@ mod tests {
             "{error:?}"
         );
         std::fs::remove_file(dir.join("scripts/other.mjs")).unwrap();
+
+        // Naming it in prose is not importing it, and every plugin's comments will do exactly
+        // that — telling the author to run it is the whole point of shipping it.
+        std::fs::write(
+            dir.join("main.ts"),
+            "// Sign before pushing: node scripts/sign-plugin.mjs sign\nexport default 1;",
+        )
+        .unwrap();
+        scan_tree(&dir).unwrap();
 
         // And importing the signer is refused, so it cannot be smuggled into the bundle.
         std::fs::write(dir.join("main.ts"), "import './scripts/sign-plugin.mjs';").unwrap();
