@@ -7,12 +7,15 @@
 
 #![allow(clippy::indexing_slicing)]
 
+use std::collections::BTreeMap;
+
 use serde_json::json;
 use vrcnext_bridge_core::Service;
 
 use super::{
-    HttpError, HttpService, MAX_HEADERS, MAX_REQUEST_BYTES, check_header, is_public, parse_method,
-    parse_url, read_capped,
+    CREDENTIAL_HEADERS, HttpError, HttpService, MAX_HEADERS, MAX_REQUEST_BYTES,
+    assert_no_credentials, check_header, is_public, outbound_headers, parse_method, parse_url,
+    read_capped,
 };
 
 #[test]
@@ -65,15 +68,81 @@ fn connection_headers_belong_to_the_bridge() {
         "Trailer",
         "Keep-Alive",
         "Proxy-Connection",
-        "Proxy-Authorization",
     ] {
         assert!(
             matches!(check_header(name, "x"), Err(HttpError::BadHeader(_))),
             "{name} must be refused"
         );
     }
-    assert!(check_header("Authorization", "Bearer abc").is_ok());
+    // An API's own key header is the plugin's business; only the credentials this machine holds
+    // are refused, and those are checked in their own test below.
     assert!(check_header("X-Api-Key", "abc").is_ok());
+    assert!(check_header("X-Steam-Key", "abc").is_ok());
+}
+
+#[test]
+fn a_credential_header_never_leaves_this_machine() {
+    for name in [
+        "Authorization",
+        "authorization",
+        "AUTHORIZATION",
+        "Proxy-Authorization",
+        "Cookie",
+        "cookie",
+        "Set-Cookie",
+    ] {
+        let refused = check_header(name, "Bearer abc");
+        assert!(
+            matches!(&refused, Err(HttpError::BadHeader(text)) if text.contains("credentials")),
+            "{name} must be refused as a credential, got {refused:?}"
+        );
+        let map = BTreeMap::from([(name.to_owned(), "Bearer abc".to_owned())]);
+        assert!(
+            matches!(outbound_headers(&map), Err(HttpError::BadHeader(_))),
+            "{name} must not survive into the header map"
+        );
+    }
+}
+
+#[test]
+fn the_finished_request_is_re_checked_whoever_set_the_header() {
+    // Not reachable through `fetch` — `outbound_headers` refuses first. This is the guard for the
+    // header nobody asked for: a helper that copies an incoming map, a future feature with its
+    // own reason. The map is built behind the caller's back, exactly as such a change would.
+    for name in CREDENTIAL_HEADERS {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::HeaderName::from_static(name),
+            reqwest::header::HeaderValue::from_static("secret"),
+        );
+        assert!(
+            matches!(
+                assert_no_credentials(&headers),
+                Err(HttpError::BadHeader(_))
+            ),
+            "{name} must be caught on the finished request"
+        );
+    }
+    assert!(assert_no_credentials(&reqwest::header::HeaderMap::new()).is_ok());
+}
+
+#[test]
+fn a_url_may_not_carry_credentials_of_its_own() {
+    for url in [
+        "https://user:token@api.example.com/x",
+        "https://user@api.example.com/x",
+        "https://:token@api.example.com/x",
+    ] {
+        let refused = parse_url(url);
+        assert!(
+            matches!(&refused, Err(HttpError::BadUrl(text)) if text.contains("credentials")),
+            "{url} must be refused, got {refused:?}"
+        );
+    }
+    assert!(
+        parse_url("https://api.example.com/x?key=abc").is_ok(),
+        "a key in the query is the API's own scheme"
+    );
 }
 
 #[test]

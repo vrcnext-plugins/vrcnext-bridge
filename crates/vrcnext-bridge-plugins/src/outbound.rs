@@ -47,24 +47,32 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// Longest deadline a caller may ask for.
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
 
-/// Headers the caller may not set.
+/// Headers that carry credentials, which a request leaving this machine may never contain.
 ///
-/// Three groups. Some describe the connection rather than the request (hop-by-hop headers,
-/// framing, the host). One identifies the bridge (`user-agent`). The rest carry credentials:
-/// the bridge holds a pairing token that grants everything it can do, and the page it serves
-/// holds a VRChat session, so a request leaving this machine must be unable to carry either —
-/// whether a plugin set it deliberately or a future refactor forwarded it by accident. Nothing
-/// here is a header the bridge would ever need to send on a plugin's behalf.
-const REFUSED_HEADERS: &[&str] = &[
+/// The bridge holds a pairing token that grants everything it can do, and the page it serves
+/// holds a VRChat session. Neither belongs in a request to a third party — not when a plugin
+/// sets it deliberately, and not when some later refactor forwards an incoming header without
+/// meaning to. Kept as its own list because that is the group with a security reason behind it:
+/// [`assert_no_credentials`] re-checks exactly these on the finished request, so removing a name
+/// here silently widens what can leave.
+///
+/// A plugin that must authenticate to a third-party API uses that API's own scheme — a query
+/// parameter, or a header of its own name such as `X-Api-Key`, which is not refused.
+pub(crate) const CREDENTIAL_HEADERS: &[&str] = &[
     "authorization",
+    "proxy-authorization",
     "cookie",
     "set-cookie",
+];
+
+/// Headers the caller may not set because they describe the connection rather than the request
+/// (hop-by-hop headers, framing, the host), or identify the bridge (`user-agent`).
+const REFUSED_HEADERS: &[&str] = &[
     "host",
     "content-length",
     "connection",
     "keep-alive",
     "proxy-connection",
-    "proxy-authorization",
     "te",
     "trailer",
     "transfer-encoding",
@@ -166,9 +174,9 @@ impl HttpService {
                     .dns_resolver(Arc::new(PublicResolver))
                     // A proxy would be the one resolving the target, out of this check's sight.
                     .no_proxy()
-                    // Stated rather than assumed: a cookie jar would carry what one host set to
-                    // the next request, which is the credential leak this service must not have.
-                    .cookie_store(false)
+                    // There is no cookie store to turn off, and that is the point: reqwest's
+                    // `cookies` feature is deliberately not enabled (see the workspace manifest),
+                    // so a `Set-Cookie` from one host cannot be replayed to the next request.
                     .build()
                     .map_err(|error| error.to_string())
             })
@@ -192,19 +200,25 @@ impl HttpService {
                 .clamp(1, MAX_TIMEOUT_MS),
         );
 
-        let mut builder = self.client()?.request(method, url).timeout(timeout);
-        if request.headers.len() > MAX_HEADERS {
-            return Err(HttpError::BadHeader(format!("count exceeds {MAX_HEADERS}")));
-        }
-        for (name, value) in &request.headers {
-            check_header(name, value)?;
-            builder = builder.header(name, value);
-        }
+        let mut builder = self
+            .client()?
+            .request(method, url)
+            .timeout(timeout)
+            .headers(outbound_headers(&request.headers)?);
         if !body.is_empty() {
             builder = builder.body(body);
         }
 
-        let response = builder.send().map_err(|error| send_error(&error))?;
+        // The request as it will actually go out, checked once more against the credential list.
+        // `outbound_headers` already refused every one of those names, so this can only fail if
+        // something else put a header on the builder — which is exactly the accident worth
+        // catching, and the reason the check is here rather than only at the parse step.
+        let outgoing = builder.build().map_err(|error| send_error(&error))?;
+        assert_no_credentials(outgoing.headers())?;
+        let response = self
+            .client()?
+            .execute(outgoing)
+            .map_err(|error| send_error(&error))?;
         read_response(response)
     }
 }
@@ -215,6 +229,14 @@ pub(crate) fn parse_url(text: &str) -> Result<reqwest::Url, HttpError> {
     match url.scheme() {
         "http" | "https" => {}
         other => return Err(HttpError::BadUrl(format!("{other} is not http(s)"))),
+    }
+    // `https://user:token@host/` is the same credential leak as an Authorization header, written
+    // somewhere a header check cannot see. Refused rather than stripped, so a plugin that meant to
+    // authenticate that way is told, instead of quietly making an anonymous request.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(HttpError::BadUrl(
+            "the URL carries credentials in it; use a header the API names instead".to_owned(),
+        ));
     }
     // An address written into the URL never reaches the resolver, so it is checked here.
     let host = url
@@ -327,8 +349,52 @@ pub(crate) fn parse_method(text: Option<&str>) -> Result<reqwest::Method, HttpEr
     reqwest::Method::from_bytes(name.as_bytes()).map_err(|_| HttpError::BadMethod(name))
 }
 
+/// The caller's headers as a [`reqwest::header::HeaderMap`], or the first reason to refuse them.
+///
+/// Every header the service sends is built here and nowhere else, so there is one path to audit
+/// rather than a loop that a later change can quietly grow a second copy of.
+pub(crate) fn outbound_headers(
+    headers: &BTreeMap<String, String>,
+) -> Result<reqwest::header::HeaderMap, HttpError> {
+    if headers.len() > MAX_HEADERS {
+        return Err(HttpError::BadHeader(format!("count exceeds {MAX_HEADERS}")));
+    }
+    let mut map = reqwest::header::HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        check_header(name, value)?;
+        let key = reqwest::header::HeaderName::try_from(name.as_str())
+            .map_err(|_| HttpError::BadHeader(format!("{name} is not a header name")))?;
+        let text = reqwest::header::HeaderValue::from_str(value)
+            .map_err(|_| HttpError::BadHeader(format!("{name} has a value it cannot carry")))?;
+        map.append(key, text);
+    }
+    assert_no_credentials(&map)?;
+    Ok(map)
+}
+
+/// Refuses a header map that carries any of [`CREDENTIAL_HEADERS`].
+///
+/// The last gate before the request leaves, and the one that does not care how the header got
+/// there: a plugin that asked for it, a helper that copied an incoming map, a header a future
+/// feature sets for its own reasons. If one is present the request is not made.
+pub(crate) fn assert_no_credentials(headers: &reqwest::header::HeaderMap) -> Result<(), HttpError> {
+    for name in CREDENTIAL_HEADERS {
+        if headers.contains_key(*name) {
+            return Err(HttpError::BadHeader(format!(
+                "{name} carries credentials and never leaves this machine"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn check_header(name: &str, value: &str) -> Result<(), HttpError> {
     let lower = name.to_ascii_lowercase();
+    if CREDENTIAL_HEADERS.contains(&lower.as_str()) {
+        return Err(HttpError::BadHeader(format!(
+            "{name} carries credentials and never leaves this machine"
+        )));
+    }
     if REFUSED_HEADERS.contains(&lower.as_str()) {
         return Err(HttpError::BadHeader(format!("{name} is set by the bridge")));
     }
@@ -433,6 +499,8 @@ impl Service for HttpService {
             "redirects": "not followed; a 3xx is returned as-is, with its location header",
             // Stated because it is the whole point and the whole risk: this reads public hosts
             // the page cannot, and it is why the non-public ranges are refused.
+            "refusedHeaders": CREDENTIAL_HEADERS,
+            "credentials": "a request may not carry Authorization, Proxy-Authorization, Cookie or Set-Cookie, and a URL may not carry userinfo; there is no cookie jar. Use the scheme the API names, such as a query parameter or X-Api-Key",
             "reach": "public internet hosts, not limited to hosts that allow cross-origin reads; loopback, private, link-local, CGNAT, multicast and other non-public addresses are refused, by name or by literal",
         })
     }

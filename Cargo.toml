@@ -46,6 +46,8 @@ sha2 = "0.11"
 ed25519-dalek = { version = "3", default-features = false, features = ["fast"] }
 # Outbound HTTP for the `outbound` service. Already in the tree through gix's transport, so this
 # adds a blocking client rather than a second TLS stack.
+# `cookies` is deliberately absent: with no jar, a `Set-Cookie` the outbound service receives
+# cannot be replayed to another host, and `Cookie` is refused on the way out. Do not add it.
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "charset", "http2", "gzip"] }
 # OSC 1.0 encode/decode for the `osc` service. Pure Rust, no C toolchain; the wire format has
 # enough corners (type tags, 4-byte padding, nested bundles) that hand-rolling it would be
