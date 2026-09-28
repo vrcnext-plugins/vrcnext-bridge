@@ -187,11 +187,16 @@ pub(crate) fn log_banner(config: &Config, paths: &Paths, token: &str, services: 
     }
 
     if config.remote {
-        log::warn!("remote control: enabled; the pairing token can run code in the page");
-        if !config.rest {
-            log::warn!(
-                "remote control: `remote/eval` is reachable over the socket only without --rest"
-            );
+        log::warn!(
+            "remote control: ENABLED (--remote). Anyone holding the pairing token can run \
+             arbitrary JavaScript inside the VRCNext page, with all of the page's access: \
+             your VRChat session, installed plugins and their data. Turn it off unless you \
+             are debugging."
+        );
+        if config.rest {
+            log::warn!("remote control: also reachable over HTTP as POST /v1/remote/eval (--rest)");
+        } else {
+            log::warn!("remote control: reachable over the WebSocket only (--rest is off)");
         }
     }
 

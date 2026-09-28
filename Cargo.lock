@@ -3628,6 +3628,7 @@ name = "vrcnext-bridge-core"
 version = "0.4.0"
 dependencies = [
  "dirs",
+ "getrandom 0.4.3",
  "log",
  "serde",
  "serde_json",

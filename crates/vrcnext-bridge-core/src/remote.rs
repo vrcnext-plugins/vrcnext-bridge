@@ -15,13 +15,17 @@
 //! runs the bundle this daemon compiles, so the service does not widen who is trusted. It does
 //! make that trust very direct, which is why it has to be switched on and why the banner says so.
 //!
+//! Each evaluation carries a random 128-bit id, and only a `remote/result` naming that id is
+//! accepted. The result is not tied to the connection the snippet was pushed on: services know
+//! nothing about sockets, and the push goes to every paired page, so any page may answer. The
+//! unguessable id is what keeps a client that never saw the snippet from answering it.
+//!
 //! # No I/O here
 //!
 //! The service only pushes a frame and waits on a channel. The transport delivers the push and
 //! routes the page's answer back through [`RemoteService::call`] like any other request.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -58,7 +62,7 @@ struct EvalParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResultParams {
-    id: u64,
+    id: String,
     ok: bool,
     #[serde(default)]
     value: Value,
@@ -74,11 +78,30 @@ struct Answer {
     error: Option<String>,
 }
 
+/// A fresh evaluation id: 128 random bits, base64url without padding (22 characters).
+///
+/// The id is the only thing tying a `remote/result` to its `eval`, and results arrive over the
+/// same shared socket every paired client uses, so it must not be guessable: a counter would let
+/// any other client answer an evaluation it never saw.
+fn eval_id() -> Result<String, ServiceError> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| ServiceError::Internal(error.to_string()))?;
+    let value = u128::from_be_bytes(bytes);
+    // 22 six-bit digits cover 132 bits; the top four are always zero.
+    Ok((0..22)
+        .rev()
+        .map(|digit| {
+            let index = usize::try_from((value >> (digit * 6)) & 0x3f).unwrap_or(0);
+            char::from(ALPHABET.get(index).copied().unwrap_or(b'A'))
+        })
+        .collect())
+}
+
 /// Pushes snippets to the page and correlates the answers.
 pub struct RemoteService {
     pusher: Arc<dyn Pusher>,
-    next_id: AtomicU64,
-    pending: Mutex<HashMap<u64, SyncSender<Answer>>>,
+    pending: Mutex<HashMap<String, SyncSender<Answer>>>,
 }
 
 impl RemoteService {
@@ -87,12 +110,11 @@ impl RemoteService {
     pub fn new(pusher: Arc<dyn Pusher>) -> Self {
         Self {
             pusher,
-            next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
         }
     }
 
-    fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<u64, SyncSender<Answer>>> {
+    fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<String, SyncSender<Answer>>> {
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -118,7 +140,7 @@ impl RemoteService {
             .min(MAX_EVAL_TIMEOUT);
 
         let (sender, receiver) = mpsc::sync_channel(1);
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = eval_id()?;
         {
             let mut pending = self.pending();
             if pending.len() >= MAX_IN_FLIGHT {
@@ -126,7 +148,7 @@ impl RemoteService {
                     "{MAX_IN_FLIGHT} evaluations are already waiting on the page"
                 )));
             }
-            pending.insert(id, sender);
+            pending.insert(id.clone(), sender);
         }
 
         self.pusher
@@ -223,7 +245,7 @@ mod tests {
                 return;
             };
             let answer = (self.answer)(data["code"].as_str().unwrap());
-            let id = data["id"].as_u64().unwrap();
+            let id = data["id"].as_str().unwrap().to_owned();
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(20));
                 let reply = service
@@ -277,7 +299,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, "remote");
         assert_eq!(events[0].1["code"], "document.title");
-        assert!(events[0].1["id"].is_u64());
+        assert!(events[0].1["id"].as_str().is_some_and(|id| id.len() == 22));
     }
 
     #[test]
@@ -300,7 +322,10 @@ mod tests {
     fn a_result_for_an_unknown_id_is_not_delivered() {
         let service = RemoteService::new(Arc::new(RecordingPusher::default()));
         let reply = service
-            .call("result", json!({ "id": 99, "ok": false, "error": "late" }))
+            .call(
+                "result",
+                json!({ "id": "AAAAAAAAAAAAAAAAAAAAAB", "ok": false, "error": "late" }),
+            )
             .unwrap();
         assert_eq!(reply, json!({ "delivered": false }));
     }
@@ -312,7 +337,7 @@ mod tests {
             impl Pusher for FailingPage {
                 fn push(&self, _event: &'static str, data: Value) {
                     let service = self.0.upgrade().unwrap();
-                    let id = data["id"].as_u64().unwrap();
+                    let id = data["id"].as_str().unwrap().to_owned();
                     thread::spawn(move || {
                         service
                             .call("result", json!({ "id": id, "ok": false, "error": "boom" }))
@@ -336,5 +361,17 @@ mod tests {
             service.call("run", json!({})),
             Err(ServiceError::UnknownMethod { .. })
         ));
+    }
+
+    #[test]
+    fn eval_ids_are_random_base64url() {
+        let a = super::eval_id().unwrap();
+        let b = super::eval_id().unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 22);
+        assert!(
+            a.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        );
     }
 }
