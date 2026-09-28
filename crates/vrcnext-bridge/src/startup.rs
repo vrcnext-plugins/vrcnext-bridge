@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result};
 use vrcnext_bridge_core::logs::{LogService, LogWriter, NullLogWriter};
 use vrcnext_bridge_core::notify::{NotifyService, SinkSet};
 use vrcnext_bridge_core::{
-    Approver, NullApprover, Paths, Pusher, RemoteService, Service, ServiceRegistry,
+    Approver, NullApprover, OscService, Paths, Pusher, RemoteService, Service, ServiceRegistry,
 };
 use vrcnext_bridge_plugins::{
     Builder, EsbuildBuilder, Git, GixGit, HttpService, PluginsService, StateService, StateStore,
@@ -54,8 +54,11 @@ pub(crate) fn build_services(
 
     let mut registry = ServiceRegistry::new();
     if config.dev {
-        registry.register(Arc::new(RemoteService::new(pusher)) as Arc<dyn Service>);
+        registry.register(Arc::new(RemoteService::new(Arc::clone(&pusher))) as Arc<dyn Service>);
     }
+    // Registered everywhere, not only where VRCNext's own OSC is missing: the page decides which
+    // of the two to use, and a bridge that hid the service would make that undiscoverable.
+    registry.register(Arc::new(OscService::new(pusher)) as Arc<dyn Service>);
     registry.register(Arc::new(NotifyService::new(build_sinks(config))) as Arc<dyn Service>);
     registry.register(Arc::new(LogService::new(Arc::clone(&log_writer))) as Arc<dyn Service>);
     registry.register(Arc::new(StateService::new(state)) as Arc<dyn Service>);

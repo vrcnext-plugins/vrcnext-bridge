@@ -47,6 +47,7 @@ pub mod handshake;
 pub mod limits;
 pub mod logs;
 pub mod notify;
+pub mod osc;
 pub mod paths;
 pub mod pusher;
 pub mod ratelimit;
@@ -60,6 +61,7 @@ pub use notify::{
     Notification, NotifyRequest, NotifyService, Sink, SinkError, SinkHealth, Urgency,
     ValidationError,
 };
+pub use osc::OscService;
 pub use paths::{Paths, PluginId};
 pub use pusher::{NullPusher, Pusher, RecordingPusher};
 pub use ratelimit::RateLimiter;

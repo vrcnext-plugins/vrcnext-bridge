@@ -47,6 +47,10 @@ ed25519-dalek = { version = "3", default-features = false, features = ["fast"] }
 # Outbound HTTP for the `outbound` service. Already in the tree through gix's transport, so this
 # adds a blocking client rather than a second TLS stack.
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "charset", "http2", "gzip"] }
+# OSC 1.0 encode/decode for the `osc` service. Pure Rust, no C toolchain; the wire format has
+# enough corners (type tags, 4-byte padding, nested bundles) that hand-rolling it would be
+# rediscovering them slowly.
+rosc = { version = "0.11", default-features = false }
 # Win32 bindings for the native confirmation dialog. Pure Rust, no headers.
 windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
 
