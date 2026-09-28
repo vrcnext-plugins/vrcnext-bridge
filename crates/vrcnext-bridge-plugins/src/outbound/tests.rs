@@ -11,14 +11,15 @@ use serde_json::json;
 use vrcnext_bridge_core::Service;
 
 use super::{
-    HttpError, HttpService, MAX_HEADERS, MAX_REQUEST_BYTES, check_header, parse_method, parse_url,
-    read_capped,
+    HttpError, HttpService, MAX_HEADERS, MAX_REQUEST_BYTES, check_header, is_public, parse_method,
+    parse_url, read_capped,
 };
 
 #[test]
 fn only_http_and_https_are_addressable() {
     assert!(parse_url("https://api.steampowered.com/x").is_ok());
     assert!(parse_url("http://example.test/x").is_ok());
+    assert!(parse_url("https://93.184.216.34/").is_ok());
     for bad in [
         "file:///etc/passwd",
         "ftp://example.test/x",
@@ -157,4 +158,44 @@ fn a_body_is_refused_once_it_passes_the_cap_while_streaming() {
         read_capped(std::io::repeat(b'x'), 1024).err(),
         Some(HttpError::ResponseTooLarge)
     );
+}
+
+#[test]
+fn non_public_addresses_are_refused_as_literals() {
+    for bad in [
+        "http://127.0.0.1/",
+        "http://2130706433/",
+        "http://10.0.0.1/",
+        "http://172.16.0.1/",
+        "http://192.168.1.1/",
+        "http://169.254.169.254/latest/meta-data",
+        "http://100.64.0.1/",
+        "http://0.0.0.0/",
+        "http://255.255.255.255/",
+        "http://224.0.0.1/",
+        "http://[::1]/",
+        "http://[::]/",
+        "http://[fd00::1]/",
+        "http://[fe80::1]/",
+        "http://[ff02::1]/",
+        "http://[::ffff:127.0.0.1]/",
+        "http://[::ffff:169.254.169.254]/",
+        "http://[64:ff9b::a00:1]/",
+    ] {
+        assert!(
+            matches!(parse_url(bad), Err(HttpError::NotPublic(_))),
+            "{bad} must be refused"
+        );
+    }
+    assert!(is_public("1.1.1.1".parse().unwrap_or([0, 0, 0, 0].into())));
+    assert!(is_public(
+        "2606:4700::1111".parse().unwrap_or([0, 0, 0, 0].into())
+    ));
+}
+
+#[test]
+fn a_name_that_resolves_to_this_machine_is_refused() {
+    let error = HttpService::new().call("fetch", json!({ "url": "http://localhost:9/" }));
+    let message = error.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(message.contains("not a public address"), "{message}");
 }

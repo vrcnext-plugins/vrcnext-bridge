@@ -6,6 +6,10 @@
 //! and is not bound by that rule, so a request routed through here reaches the same hosts a
 //! `curl` on this machine would.
 //!
+//! It does not reach this machine or its network, though: loopback, private, link-local and the
+//! other non-public ranges are refused, both as literals in the URL and as what a name resolves
+//! to (see [`is_public`]).
+//!
 //! That is deliberately more reach than the page has, and it is why the host asks the user about
 //! the concrete host before every first request to it. This service does not decide who may call
 //! it: by the time a call arrives the page has already been told yes. What it does own is the
@@ -19,6 +23,8 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -72,6 +78,11 @@ pub enum HttpError {
     /// The response body is not valid UTF-8.
     #[error("response is not text")]
     NotText,
+    /// The host is, or resolves only to, an address that is not on the public internet:
+    /// loopback, a private or link-local network, or another range that names this machine or
+    /// its neighbours rather than a server somewhere else.
+    #[error("{0} is not a public address")]
+    NotPublic(String),
     /// The request did not complete.
     #[error("{0}")]
     Failed(String),
@@ -134,6 +145,12 @@ impl HttpService {
                     // to a host the user never approved, so the plugin sees the 3xx and its
                     // `location` header, and asks again — through the host's prompt — if it wants.
                     .redirect(reqwest::redirect::Policy::none())
+                    // Every name is resolved here and only public addresses are handed on, so a
+                    // name that resolves — or later re-resolves — to this machine or its network
+                    // is never connected to.
+                    .dns_resolver(Arc::new(PublicResolver))
+                    // A proxy would be the one resolving the target, out of this check's sight.
+                    .no_proxy()
                     .build()
                     .map_err(|error| error.to_string())
             })
@@ -169,9 +186,7 @@ impl HttpService {
             builder = builder.body(body);
         }
 
-        let response = builder
-            .send()
-            .map_err(|error| HttpError::Failed(error.to_string()))?;
+        let response = builder.send().map_err(|error| send_error(&error))?;
         read_response(response)
     }
 }
@@ -180,9 +195,110 @@ impl HttpService {
 pub(crate) fn parse_url(text: &str) -> Result<reqwest::Url, HttpError> {
     let url = reqwest::Url::parse(text).map_err(|error| HttpError::BadUrl(error.to_string()))?;
     match url.scheme() {
-        "http" | "https" => Ok(url),
-        other => Err(HttpError::BadUrl(format!("{other} is not http(s)"))),
+        "http" | "https" => {}
+        other => return Err(HttpError::BadUrl(format!("{other} is not http(s)"))),
     }
+    // An address written into the URL never reaches the resolver, so it is checked here.
+    let host = url
+        .host_str()
+        .ok_or_else(|| HttpError::BadUrl("the URL names no host".to_owned()))?;
+    let literal = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .ok();
+    if let Some(ip) = literal.filter(|ip| !is_public(*ip)) {
+        return Err(HttpError::NotPublic(ip.to_string()));
+    }
+    Ok(url)
+}
+
+/// Whether `ip` is an address on the public internet.
+///
+/// Refused: unspecified, loopback, private (RFC 1918 and `fc00::/7`), link-local (which holds
+/// the cloud metadata address `169.254.169.254`, and `fe80::/10`), shared/CGNAT
+/// (`100.64.0.0/10`), `0.0.0.0/8`, broadcast, reserved (`240.0.0.0/4`), multicast, and any IPv6
+/// address that embeds one of those IPv4 addresses (IPv4-mapped, IPv4-compatible, NAT64).
+pub(crate) fn is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_public_v4(ip),
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            let [first, .., high, low] = segments;
+            let embedded = ip.to_ipv4_mapped().or_else(|| {
+                let prefix = matches!(
+                    segments,
+                    [0x64, 0xff9b, 0, 0, 0, 0, _, _] | [0, 0, 0, 0, 0, 0, _, _]
+                );
+                prefix.then(|| Ipv4Addr::from((u32::from(high) << 16) | u32::from(low)))
+            });
+            if let Some(v4) = embedded {
+                return is_public_v4(v4);
+            }
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_multicast()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+fn is_public_v4(ip: Ipv4Addr) -> bool {
+    let [first, second, ..] = ip.octets();
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || first == 0
+        || first >= 240
+        || (first == 100 && (second & 0xc0) == 64))
+}
+
+/// The address filter, as a resolver: only public addresses come out of it.
+///
+/// Doing it at resolution rather than once up front is what defeats DNS rebinding — there is no
+/// second lookup between the check and the connect for a name to change its answer in.
+struct PublicResolver;
+
+impl reqwest::dns::Resolve for PublicResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let lookup = host.clone();
+            let found: Vec<SocketAddr> =
+                tokio::task::spawn_blocking(move || (lookup.as_str(), 0).to_socket_addrs())
+                    .await??
+                    .collect();
+            let public: Vec<SocketAddr> = found
+                .iter()
+                .copied()
+                .filter(|addr| is_public(addr.ip()))
+                .collect();
+            if public.is_empty() {
+                let shown = found
+                    .first()
+                    .map_or_else(|| host.clone(), |addr| format!("{host} ({})", addr.ip()));
+                return Err(Box::new(HttpError::NotPublic(shown)) as Box<_>);
+            }
+            let addrs: reqwest::dns::Addrs = Box::new(public.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+/// A failed send, with a refusal from [`PublicResolver`] brought back to its own variant.
+fn send_error(error: &reqwest::Error) -> HttpError {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if let Some(refused) = current.downcast_ref::<HttpError>() {
+            return refused.clone();
+        }
+        source = current.source();
+    }
+    HttpError::Failed(error.to_string())
 }
 
 pub(crate) fn parse_method(text: Option<&str>) -> Result<reqwest::Method, HttpError> {
@@ -299,7 +415,7 @@ impl Service for HttpService {
             "redirects": "not followed; a 3xx is returned as-is, with its location header",
             // Stated because it is the whole point and the whole risk: this reaches what the
             // machine reaches, including its own network, which the page cannot.
-            "reach": "whatever this machine can reach; not limited to hosts that allow cross-origin reads",
+            "reach": "public internet hosts, not limited to hosts that allow cross-origin reads; loopback, private, link-local, CGNAT, multicast and other non-public addresses are refused, by name or by literal",
         })
     }
 
