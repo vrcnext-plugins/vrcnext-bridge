@@ -79,6 +79,10 @@ pub enum SignatureError {
     /// The signature does not verify against the public key it carries.
     #[error("the signature is not valid for the key it names")]
     Invalid,
+    /// The tree holds a symlink. A signed tree is plain files only: a link's target is not part
+    /// of the signature, so what it points at could change without the digest noticing.
+    #[error("{0} is a symlink; a signed tree may not contain one")]
+    Symlink(String),
     /// The tree could not be read, or is larger than a plugin is allowed to be.
     #[error("the tree cannot be digested: {0}")]
     Unreadable(String),
@@ -171,19 +175,19 @@ pub fn tree_digest(root: &Path) -> Result<String, SignatureError> {
 
 /// Append the relative path of every file under `dir` to `out`.
 ///
-/// Symlinks are not followed and not recorded: a symlink cannot contribute content to the
-/// bundle, and following one would let a repository digest files outside its own tree.
+/// A symlink anywhere in the tree refuses it: following one would digest files outside the
+/// tree, and skipping one would leave something unsigned in a tree that claims to be signed.
 fn collect(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), SignatureError> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|_| SignatureError::Unreadable(display(root, dir)))?
-        .flatten();
+    let entries =
+        std::fs::read_dir(dir).map_err(|_| SignatureError::Unreadable(display(root, dir)))?;
     for entry in entries {
+        let entry = entry.map_err(|_| SignatureError::Unreadable(display(root, dir)))?;
         let path = entry.path();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
+        let kind = entry
+            .file_type()
+            .map_err(|_| SignatureError::Unreadable(display(root, &path)))?;
         if kind.is_symlink() {
-            continue;
+            return Err(SignatureError::Symlink(display(root, &path)));
         }
         if kind.is_dir() {
             if path.file_name().is_some_and(|name| name == ".git") {

@@ -182,3 +182,15 @@ fn a_key_id_is_stable_grouped_and_case_insensitive() {
     assert_eq!(id.matches('-').count(), 7);
     assert_ne!(id, key_id(&public_hex(&signer(2))));
 }
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_anywhere_in_the_tree_is_refused() {
+    let dir = signed_tree("symlink", "demo", &signer(1), FILES);
+    std::os::unix::fs::symlink("/etc/hostname", dir.join("src/link.txt")).unwrap();
+    assert_eq!(
+        tree_digest(&dir),
+        Err(SignatureError::Symlink("src/link.txt".to_owned()))
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
