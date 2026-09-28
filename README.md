@@ -96,6 +96,16 @@ at each step (`awaiting_confirmation`, `clone`, `validate`, `policy`, `signature
    `<script`, `.innerHTML =`, `insertAdjacentHTML`, `setTimeout(` with a string first argument,
    `require(`, `process.`. Plugins reach the world only through `ctx.*`. This is a text scan
    that makes honest mistakes visible; it is not a sandbox and does not claim to be.
+
+   Before those names, the same pass applies the **shape** rules in
+   `crates/vrcnext-bridge-plugins/src/obfuscation.rs`, because a table of names only works on
+   code a person could have read: `minified` (a line over 1000 characters), `packed source` (a
+   file of 20+ lines averaging over 250), `escape sequences` (more than eight `\xNN`/`\uNNNN` in
+   a row), `mangled identifiers` (`_0x` + hex, what `javascript-obfuscator` emits), `opaque
+   blob` (an unbroken 256-character run over a base64/hex alphabet at ≥ 3.5 bits of Shannon
+   entropy per character) and `invisible characters` (zero-width and bidirectional overrides —
+   Trojan Source). They refuse one honest thing on purpose, an inlined binary `data:` URI, which
+   a text scan cannot tell from a payload.
 5. **Verify the signature.** `plugin.sig` at the root must be an Ed25519 signature, version 1,
    naming this plugin's id, over a SHA-256 digest of every file in the clone except `.git/` and
    itself. Then the key has to be one the user has accepted: an unknown fingerprint is a second

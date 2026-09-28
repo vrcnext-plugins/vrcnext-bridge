@@ -8,6 +8,7 @@
 //! | [`state`] | the page's data survives, atomically, within fixed bounds |
 //! | [`manifest`] | only a well-formed `plugin.json` reaches the import table |
 //! | [`policy`] | no plugin source reaches past `ctx.*` |
+//! | [`obfuscation`] | the source a reviewer reads is the source that runs |
 //! | [`signing`] | only a tree an author signed is installed, and only under their own key |
 //! | [`trust`] | a signing key becomes trusted once, natively, and stays the plugin's own |
 //! | [`git`] | cloning and fetching happen in-process, under a deadline |
@@ -21,6 +22,7 @@ pub mod build;
 pub mod fsutil;
 pub mod git;
 pub mod manifest;
+pub mod obfuscation;
 pub mod policy;
 pub mod service;
 pub mod signing;

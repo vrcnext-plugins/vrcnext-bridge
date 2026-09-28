@@ -9,6 +9,10 @@
 //! This is a text scan, not a parser. It is meant to catch honest mistakes and make dishonest
 //! ones obvious in a review, not to be unbypassable; the docs say so. The rules live in one
 //! table, [`RULES`], mirrored in the documentation, with one unit test each.
+//!
+//! A table of names only works on code a person could have read, so every file goes through
+//! [`crate::obfuscation`] first: source shaped like a bundle, an escape sequence or a payload is
+//! refused before the names are looked for, because otherwise the names would not be there.
 
 use std::path::{Path, PathBuf};
 
@@ -235,6 +239,9 @@ fn imports_exempt_file(text: &str) -> Option<&'static str> {
 ///
 /// The first violation, with its 1-based line.
 pub fn scan_source(file: &str, text: &str) -> Result<(), PolicyError> {
+    // Shape before names: a minified or escaped file would pass every rule below by hiding the
+    // words they look for, so it never reaches them.
+    crate::obfuscation::scan(file, text)?;
     for (index, line) in text.lines().enumerate() {
         for rule in RULES {
             if matches(rule.matcher, line) {
@@ -537,7 +544,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
 
         let dir = scratch_dir("policy-size");
-        let big = "x".repeat(usize::try_from(super::MAX_SOURCE_BYTES).unwrap());
+        // Ordinary-looking lines, so the size limit is what refuses this and not the shape rules.
+        let line = format!("{};\n", "x".repeat(99));
+        let mut big = String::new();
+        while u64::try_from(big.len()).unwrap() <= super::MAX_SOURCE_BYTES {
+            big.push_str(&line);
+        }
         std::fs::write(dir.join("a.ts"), &big).unwrap();
         std::fs::write(dir.join("b.ts"), "y").unwrap();
         assert_eq!(scan_tree(&dir), Err(PolicyError::TooLarge));
