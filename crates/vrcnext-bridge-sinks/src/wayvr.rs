@@ -135,7 +135,7 @@ impl WayvrSink {
         Ok(bytes)
     }
 
-    /// Whether **any** local socket holds `port`, according to `/proc/net/udp{,6}`.
+    /// Whether **any** local socket holds `port`, asked of the kernel by trying to bind it.
     ///
     /// # What this does and does not tell you
     ///
@@ -143,43 +143,41 @@ impl WayvrSink {
     /// program squatting the port reads as `Up`. The useful half is the negative: nothing bound
     /// means a datagram is definitely going nowhere, which is worth surfacing.
     ///
-    /// Only the port is compared, not the address. A socket bound to another interface entirely
-    /// would be a false positive; matching the address would mean decoding `/proc`'s
-    /// endian-swapped hex for v4, v6 and v4-mapped-v6, and then still having to treat wildcard
-    /// binds as matches. Not worth the failure modes for an advisory signal.
+    /// # Why a bind and not `/proc/net/udp`
     ///
-    /// Returns `None` only when neither table could be read at all.
+    /// The table in `/proc` is produced a page per `read`, and each read resumes by counting
+    /// rows from the start. When sockets earlier in the table close between two reads, the count
+    /// lands past rows it never showed, so a socket that is bound the whole time can be missing
+    /// from the text. Any process creating and closing UDP sockets makes this happen; it cannot
+    /// be read around. A bind is answered by the kernel's own port lookup, atomically.
+    ///
+    /// The probe binds the wildcard without `SO_REUSEADDR`, which conflicts with any socket on
+    /// the port: IPv6 `[::]` first, which on Linux is dual-stack and so also collides with IPv4
+    /// holders, then `0.0.0.0` for hosts with IPv6 off or a v6-only default. The socket is closed
+    /// at once, so the port is held for the length of two syscalls.
+    ///
+    /// Returns `None` when neither bind gives an answer (a denied bind, say).
     #[cfg(target_os = "linux")]
     fn is_listener_bound(port: u16) -> Option<bool> {
-        let suffix = format!(":{port:04X}");
-        let mut read_any = false;
+        use std::io::ErrorKind;
+        use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
 
-        for path in ["/proc/net/udp", "/proc/net/udp6"] {
-            // A missing table is not a failure. IPv6 is routinely disabled, and letting that
-            // discard a definitive answer from the IPv4 table reported Unknown on hosts where
-            // the truth was perfectly knowable.
-            let Ok(content) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            read_any = true;
-
-            for line in content.lines().skip(1) {
-                // `sl local_address rem_address st …` — the local address is the second column.
-                //
-                // The state column is deliberately not filtered on. A socket that has called
-                // connect() shows `01` rather than `07`, and it still owns the port; requiring
-                // `07` silently missed those.
-                if line
-                    .split_whitespace()
-                    .nth(1)
-                    .is_some_and(|local| local.ends_with(&suffix))
-                {
-                    return Some(true);
+        let mut answered = false;
+        for addr in [
+            std::net::SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+            std::net::SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+        ] {
+            match UdpSocket::bind(addr) {
+                Ok(probe) => {
+                    drop(probe);
+                    answered = true;
                 }
+                Err(error) if error.kind() == ErrorKind::AddrInUse => return Some(true),
+                // No IPv6 on this host, or a bind this process may not make: no answer here.
+                Err(_) => {}
             }
         }
-
-        read_any.then_some(false)
+        answered.then_some(false)
     }
 }
 
