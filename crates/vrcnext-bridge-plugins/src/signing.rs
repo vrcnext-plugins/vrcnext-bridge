@@ -113,7 +113,6 @@ struct SignatureFile {
     public_key: String,
     digest: String,
     signature: String,
-    #[serde(default)]
     signed_at: u64,
 }
 

@@ -57,8 +57,7 @@ pub struct ListEntry {
     pub installed_at: u64,
     /// Milliseconds since the epoch; equals `installedAt` until the first update.
     pub updated_at: u64,
-    /// Fingerprint of the key this plugin is installed under. Empty only for a plugin installed
-    /// before signatures were required, which the next update will pin.
+    /// Fingerprint of the key this plugin is installed under.
     pub key_id: String,
 }
 
@@ -70,9 +69,7 @@ struct Record {
     commit: String,
     installed_at: u64,
     updated_at: u64,
-    /// The signing key this plugin belongs to. `default` so records written before signatures
-    /// existed still load; an empty one is pinned by the first update that verifies.
-    #[serde(default)]
+    /// The signing key this plugin belongs to.
     key_id: String,
 }
 
@@ -203,6 +200,24 @@ impl PluginsService {
         self.state
             .get(RECORDS_NS, id.as_str())
             .and_then(|value| serde_json::from_value(value).ok())
+    }
+
+    /// The record an update works from. A record that does not parse, or names no key, cannot
+    /// say who the plugin belongs to; the only way forward is to uninstall and install again.
+    fn signed_record(&self, id: &PluginId) -> Result<Record, ServiceError> {
+        let value = self
+            .state
+            .get(RECORDS_NS, id.as_str())
+            .ok_or_else(|| bad("not_installed", id))?;
+        serde_json::from_value::<Record>(value)
+            .ok()
+            .filter(|record| !record.key_id.is_empty())
+            .ok_or_else(|| {
+                bad(
+                    "reinstall_required",
+                    format!("{id} has no recorded signing key; uninstall it and install it again"),
+                )
+            })
     }
 
     fn installed_ids(&self) -> Vec<PluginId> {
@@ -382,16 +397,14 @@ impl PluginsService {
     /// installed under.
     ///
     /// This asks every time, and being already trusted for *another* plugin is not an excuse:
-    /// trusting an author is not consenting to them taking over someone else's plugin. An empty
-    /// recorded key is a plugin installed before signatures were required, so there is nothing
-    /// to have changed and the key is simply pinned.
+    /// trusting an author is not consenting to them taking over someone else's plugin.
     fn confirm_key_change(
         &self,
         id: &PluginId,
         was: &str,
         signature: &VerifiedSignature,
     ) -> Result<(), ServiceError> {
-        if was.is_empty() || was == signature.key_id {
+        if was == signature.key_id {
             return Ok(());
         }
         self.confirm(
@@ -524,7 +537,7 @@ impl PluginsService {
         let p: IdParams = Self::parse(params)?;
         let id = PluginId::parse(&p.id).map_err(|error| bad("invalid_id", error))?;
         let _guard = self.lock();
-        let record = self.record(&id).ok_or_else(|| bad("not_installed", &id))?;
+        let record = self.signed_record(&id)?;
         self.confirm(
             "update",
             Some(&id),
@@ -586,15 +599,18 @@ impl PluginsService {
         let p: IdParams = Self::parse(params)?;
         let id = PluginId::parse(&p.id).map_err(|error| bad("invalid_id", error))?;
         let _guard = self.lock();
-        let record = self.record(&id).ok_or_else(|| bad("not_installed", &id))?;
+        // Read loosely: a record too broken for anything else must still be removable, since
+        // uninstalling is how it gets fixed.
+        let record = self
+            .state
+            .get(RECORDS_NS, id.as_str())
+            .ok_or_else(|| bad("not_installed", &id))?;
+        let url = record.get("url").and_then(Value::as_str).unwrap_or("?");
         self.confirm(
             "uninstall",
             Some(&id),
             format!("Uninstall plugin {id}?"),
-            format!(
-                "Installed from {}\nIts settings will be deleted.",
-                record.url
-            ),
+            format!("Installed from {url}\nIts settings will be deleted."),
         )?;
 
         self.progress("uninstall", Some(&id), "remove", "removing the clone");

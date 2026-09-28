@@ -791,3 +791,22 @@ fn forgetting_a_key_asks_first_and_uninstalls_nothing() {
         .unwrap();
     assert_eq!(operations(&r.approver).last().unwrap(), "trust_key");
 }
+
+#[test]
+fn a_record_without_a_key_must_be_reinstalled_but_can_be_uninstalled() {
+    let r = installed("keyless");
+    let mut record = r.state.get(RECORDS_NS, "friend-alerts").unwrap();
+    record.as_object_mut().unwrap().remove("keyId");
+    r.state.set(RECORDS_NS, "friend-alerts", record).unwrap();
+
+    let error = r
+        .service
+        .call("update", json!({ "id": "friend-alerts" }))
+        .unwrap_err();
+    assert!(error.to_string().contains("reinstall_required"), "{error}");
+
+    r.service
+        .call("uninstall", json!({ "id": "friend-alerts" }))
+        .unwrap();
+    assert!(r.state.get(RECORDS_NS, "friend-alerts").is_none());
+}

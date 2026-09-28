@@ -148,6 +148,17 @@ fn an_unreadable_or_future_format_is_refused_rather_than_ignored() {
         verify(&dir, "demo").unwrap_err(),
         SignatureError::Malformed(_)
     ));
+
+    file["version"] = 1.into();
+    file.as_object_mut().unwrap().remove("signedAt");
+    std::fs::write(dir.join(SIGNATURE_FILE), file.to_string()).unwrap();
+    assert!(
+        matches!(
+            verify(&dir, "demo").unwrap_err(),
+            SignatureError::Malformed(_)
+        ),
+        "signedAt is required"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
