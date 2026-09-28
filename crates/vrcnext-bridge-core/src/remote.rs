@@ -10,7 +10,7 @@
 //!
 //! # Trust
 //!
-//! This is deliberately **off by default** (`--remote`). Anything holding the pairing token can
+//! This is deliberately **off by default** (`--dev`). Anything holding the pairing token can
 //! already do everything the page can do — install plugins, read state — and the page itself
 //! runs the bundle this daemon compiles, so the service does not widen who is trusted. It does
 //! make that trust very direct, which is why it has to be switched on and why the banner says so.
@@ -188,7 +188,7 @@ impl Service for RemoteService {
     }
 
     fn summary(&self) -> &'static str {
-        "evaluates snippets inside the paired VRCNext page (enabled with --remote)"
+        "evaluates snippets inside the paired VRCNext page (enabled with --dev)"
     }
 
     fn describe(&self) -> Value {

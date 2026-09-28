@@ -116,7 +116,7 @@ async fn with_rest_the_surface_is_there_and_reaches_the_registry() {
 #[tokio::test]
 async fn the_refusal_names_the_flag_rather_than_looking_like_a_typo() {
     let text = body_of(false, "POST", "/v1/plugins/build").await;
-    assert!(text.contains("--rest"), "{text}");
+    assert!(text.contains("--dev"), "{text}");
 }
 
 #[tokio::test]

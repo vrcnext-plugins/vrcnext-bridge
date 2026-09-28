@@ -22,15 +22,15 @@ page  ──WebSocket──▶  vrcnext-bridge  ──gix (pure Rust, HTTPS)─�
 
 ```
 WS   /v1/ws                     one persistent socket — what the plugin system uses
-GET  /v1/health                 is it up, which version, which services — no token needed
-                                — everything below needs --rest —
+GET  /v1/health                 is it up, which version — no token needed
+                                — everything below needs --dev —
 GET  /v1/describe               every service and target, in full
 POST /v1/<service>/<method>     one call — for curl and anything else that is not the page
 ```
 
 **The socket is the only way the plugin system talks to the bridge.** `/v1/ws` and the
 `/v1/health` probe the page opens with are all a normal install serves; a bridge started without
-`--rest` answers 404 on everything else, and says so by naming the flag. The REST surface is a
+`--dev` answers 404 on everything else, and says so by naming the flag. The REST surface is a
 second way into the same services for scripts and agents — a `curl`, an `eval` through `remote`,
 a rebuild — and a second way in is a thing to ask for rather than to leave open. The one build
 an installer needs before the daemon is even useful is `vrcnext-bridge --build-plugins`, which
@@ -274,7 +274,7 @@ Honest accounting, because this was reverse-engineered rather than read from a s
 | `POST` | `/v1/notify/targets` | targets and the fields each honours |
 | `POST` | `/v1/logs/write` | append a batch of plugin log lines to the log file |
 | `POST` | `/v1/logs/info` | where that file is and how big it has grown |
-| `POST` | `/v1/remote/eval` | run a snippet inside the paired page and return its result. Only with `--remote`; see [Remote control](docs/running.md#remote-control) |
+| `POST` | `/v1/remote/eval` | run a snippet inside the paired page and return its result. Only with `--dev`; see [Remote control](docs/running.md#remote-control) |
 
 ## Security
 

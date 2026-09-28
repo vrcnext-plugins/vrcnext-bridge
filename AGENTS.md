@@ -7,7 +7,7 @@ They apply here too. Bridge-specific:
   filtered. Scoped `#[allow(..., reason = "...")]` over blanket suppressions.
 - Deploy by copying `target/release/vrcnext-bridge` to `~/.vrcnext-plugins/bin/` and restarting
   the `vrcnext-bridge.service` user unit; the page reconnects on its own, no VRCNext restart.
-- `--remote` (set in the unit) enables `remote/eval`; `scripts/remote-eval.sh` (`vrcnext-eval`
+- `--dev` (set in the unit) enables the REST surface and `remote/eval`; `scripts/remote-eval.sh` (`vrcnext-eval`
   on PATH) is how agents inspect and drive the page without the user's mouse.
 - Services are synchronous and know nothing about sockets; new capabilities implement `Service`
   and register in `startup.rs`.

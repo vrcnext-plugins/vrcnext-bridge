@@ -91,24 +91,19 @@ pub(crate) struct Config {
     #[arg(long)]
     pub(crate) no_log_capture: bool,
 
-    /// Offer the `remote` service: `POST /v1/remote/eval` runs a snippet inside the paired
-    /// VRCNext page and returns its result.
+    /// Developer mode: open the ways in that only development needs.
     ///
-    /// Off by default. Anyone holding the pairing token can then drive the app directly, which
-    /// is the point — a script or an agent can inspect and operate the page without touching the
-    /// desktop's pointer — but it is also why it has to be asked for.
-    #[arg(long, env = "VRCNEXT_BRIDGE_REMOTE")]
-    pub(crate) remote: bool,
-
-    /// Offer the REST call surface: `GET /v1/describe` and `POST /v1/<service>/<method>`.
+    /// Adds the REST call surface (`GET /v1/describe`, `POST /v1/<service>/<method>`) and the
+    /// `remote` service, whose `POST /v1/remote/eval` runs a snippet inside the paired VRCNext
+    /// page and returns its result. Both exist so a script or an agent can inspect and drive the
+    /// page from outside it.
     ///
-    /// Off by default, and not part of normal use. The plugin system and its plugins reach the
-    /// bridge over the shared WebSocket alone; `/v1/ws` and the `/v1/health` probe it opens with
-    /// are always served, so an end user never needs this. It exists so a script or an agent can
-    /// call the same services from outside the page — `curl` a service, drive `remote`, rebuild
-    /// the bundle — which is a second way in, and therefore asked for rather than assumed.
-    #[arg(long, env = "VRCNEXT_BRIDGE_REST")]
-    pub(crate) rest: bool,
+    /// Off by default, and never needed to run VRCNext with plugins: the plugin system reaches
+    /// the bridge over the shared WebSocket alone, and `/v1/ws` and `/v1/health` are always
+    /// served. Anyone holding the pairing token can run arbitrary JavaScript in the page while
+    /// this is on, which is why it has to be asked for.
+    #[arg(long, env = "VRCNEXT_BRIDGE_DEV")]
+    pub(crate) dev: bool,
 
     /// Compile the installed plugins into the theme bundle and exit.
     ///

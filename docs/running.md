@@ -92,7 +92,7 @@ curl -s http://127.0.0.1:42081/v1/health
 | `--rate` / `--burst` | `5` / `10` | Token bucket, shared by HTTP calls and socket requests. |
 | `--threads` | `4` | Runtime worker threads. Services run on a separate blocking pool. |
 | `--log` | `info` | `debug` logs every delivery. |
-| `--remote` | off | Offer `remote/eval`: run snippets inside the page. See [Remote control](#remote-control). |
+| `--dev` | off | Developer mode: the REST call surface and `remote/eval`, which runs snippets inside the page. Never needed for normal use. See [Remote control](#remote-control). |
 
 Each also reads an environment variable — see `vrcnext-bridge --help`.
 
@@ -106,13 +106,13 @@ just started it.
 
 ## Remote control
 
-Started with `--remote`, the bridge offers one more service: `POST /v1/remote/eval` takes
+Started with `--dev`, the bridge offers one more service: `POST /v1/remote/eval` takes
 `{ "code": "…", "timeoutMs": 10000 }`, pushes the snippet to the paired page over the socket, and
 answers with whatever the page returned. It exists so that a script or an agent can inspect and
 drive VRCNext — open a tab, read a card, click a button, check a layout — without a synthetic
 mouse and without taking the pointer from whoever is at the desk.
 
-The snippet is the body of an `async` function. `host` (the plugin host's handle, with `manager`)
+The snippet is the body of an `async` function. `host` (the plugin host's handle), `manager` (the plugin manager)
 and a few helpers are in scope: `text(selector)`, `click(selector)`, `visible(selector)`,
 `rects(selector)` and `sleep(ms)`. Everything else the page has — `showTab`, `document`, VRCNext's
 own globals — is there as usual.

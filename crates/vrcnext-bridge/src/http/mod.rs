@@ -56,7 +56,7 @@ pub(crate) async fn serve(
         broadcaster,
     });
 
-    let app = router(config.rest, state, guard);
+    let app = router(config.dev, state, guard);
 
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
@@ -77,13 +77,13 @@ pub(crate) async fn serve(
 ///
 /// `/v1/ws` and `/v1/health` are always served: the socket every plugin call rides on, and the
 /// unauthenticated probe the page opens with. Nothing else is needed to run VRCNext with
-/// plugins, so nothing else is offered unless `--rest` asks for it — the REST call surface is a
+/// plugins, so nothing else is offered unless `--dev` asks for it — the REST call surface is a
 /// second way into the same services, for scripts and agents rather than for the page.
-fn router(rest: bool, state: Arc<AppState>, guard: Arc<Guard>) -> Router {
+fn router(dev: bool, state: Arc<AppState>, guard: Arc<Guard>) -> Router {
     let mut app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/ws", get(ws::upgrade));
-    if rest {
+    if dev {
         app = app
             .route("/v1/describe", get(describe))
             .route("/v1/{service}/{method}", post(call))
@@ -140,7 +140,7 @@ async fn rest_disabled() -> Response {
     error(
         404,
         "not_found",
-        "no such endpoint; the REST call surface is off — start the bridge with --rest to use it",
+        "no such endpoint; the REST call surface is off — start the bridge with --dev to use it",
     )
 }
 

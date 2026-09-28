@@ -53,7 +53,7 @@ pub(crate) fn build_services(
     );
 
     let mut registry = ServiceRegistry::new();
-    if config.remote {
+    if config.dev {
         registry.register(Arc::new(RemoteService::new(pusher)) as Arc<dyn Service>);
     }
     registry.register(Arc::new(NotifyService::new(build_sinks(config))) as Arc<dyn Service>);
@@ -178,26 +178,16 @@ pub(crate) fn log_banner(config: &Config, paths: &Paths, token: &str, services: 
         log::info!("plugin logs: {logs}");
     }
 
-    if config.rest {
+    if config.dev {
         log::warn!(
-            "REST call surface: enabled; the pairing token can call every service over POST /v1/<service>/<method>"
+            "developer mode: ENABLED (--dev). Anyone holding the pairing token can call every \
+             service over POST /v1/<service>/<method> and run arbitrary JavaScript inside the \
+             VRCNext page through POST /v1/remote/eval, with all of the page's access: your \
+             VRChat session, installed plugins and their data. Turn it off unless you are \
+             developing."
         );
     } else {
-        log::info!("REST call surface: off (--rest); the socket and /v1/health are served");
-    }
-
-    if config.remote {
-        log::warn!(
-            "remote control: ENABLED (--remote). Anyone holding the pairing token can run \
-             arbitrary JavaScript inside the VRCNext page, with all of the page's access: \
-             your VRChat session, installed plugins and their data. Turn it off unless you \
-             are debugging."
-        );
-        if config.rest {
-            log::warn!("remote control: also reachable over HTTP as POST /v1/remote/eval (--rest)");
-        } else {
-            log::warn!("remote control: reachable over the WebSocket only (--rest is off)");
-        }
+        log::info!("developer mode: off; only the socket and /v1/health are served");
     }
 
     if config.allow_origins.is_empty() {

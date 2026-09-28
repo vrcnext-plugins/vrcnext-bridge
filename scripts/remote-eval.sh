@@ -6,9 +6,9 @@
 #   remote-eval.sh - < snippet.js
 #   remote-eval.sh --timeout 20000 'await sleep(1000); return text("#tab9 h2")'
 #
-# The snippet is the body of an async function. `host` (the plugin host handle) and the helpers
+# The snippet is the body of an async function. `host` (the plugin host handle), `manager` and the helpers
 # `text(sel)`, `click(sel)`, `visible(sel)`, `rects(sel)` and `sleep(ms)` are in scope.
-# Requires the bridge to run with `--remote`; the token comes from the data directory.
+# Requires the bridge to run with `--dev`; the token comes from the data directory.
 set -euo pipefail
 
 endpoint="${VRCNEXT_BRIDGE_ENDPOINT:-http://127.0.0.1:42081}"
