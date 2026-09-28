@@ -56,18 +56,7 @@ pub(crate) async fn serve(
         broadcaster,
     });
 
-    let app = Router::new()
-        .route("/v1/health", get(health))
-        .route("/v1/describe", get(describe))
-        .route("/v1/ws", get(ws::upgrade))
-        .route("/v1/{service}/{method}", post(call))
-        .fallback(not_found)
-        .method_not_allowed_fallback(method_not_allowed)
-        .layer(axum::middleware::from_fn_with_state(
-            guard,
-            guard::middleware,
-        ))
-        .with_state(state);
+    let app = router(config.rest, state, guard);
 
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
@@ -82,6 +71,32 @@ pub(crate) async fn serve(
         })
         .await
         .context("server stopped")
+}
+
+/// Everything this bridge answers on.
+///
+/// `/v1/ws` and `/v1/health` are always served: the socket every plugin call rides on, and the
+/// unauthenticated probe the page opens with. Nothing else is needed to run VRCNext with
+/// plugins, so nothing else is offered unless `--rest` asks for it — the REST call surface is a
+/// second way into the same services, for scripts and agents rather than for the page.
+fn router(rest: bool, state: Arc<AppState>, guard: Arc<Guard>) -> Router {
+    let mut app = Router::new()
+        .route("/v1/health", get(health))
+        .route("/v1/ws", get(ws::upgrade));
+    if rest {
+        app = app
+            .route("/v1/describe", get(describe))
+            .route("/v1/{service}/{method}", post(call))
+            .fallback(not_found);
+    } else {
+        app = app.fallback(rest_disabled);
+    }
+    app.method_not_allowed_fallback(method_not_allowed)
+        .layer(axum::middleware::from_fn_with_state(
+            guard,
+            guard::middleware,
+        ))
+        .with_state(state)
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Response {
@@ -113,6 +128,19 @@ async fn describe(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
 
 async fn not_found() -> Response {
     error(404, "not_found", "no such endpoint")
+}
+
+/// The same 404, naming the flag.
+///
+/// A missing route and a route that was never registered look identical from outside, and the
+/// difference is exactly what the caller needs to know: `POST /v1/plugins/build` against a
+/// default bridge is not a typo, it is a bridge that was not started for that.
+async fn rest_disabled() -> Response {
+    error(
+        404,
+        "not_found",
+        "no such endpoint; the REST call surface is off — start the bridge with --rest to use it",
+    )
 }
 
 async fn method_not_allowed() -> Response {
@@ -186,3 +214,7 @@ async fn read_params(body: Body) -> Result<Value, Response> {
     serde_json::from_str(text)
         .map_err(|parse_error| error(400, "bad_request", &format!("invalid JSON: {parse_error}")))
 }
+
+#[cfg(test)]
+#[path = "mod/tests.rs"]
+mod tests;

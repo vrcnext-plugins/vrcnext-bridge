@@ -100,6 +100,24 @@ pub(crate) struct Config {
     #[arg(long, env = "VRCNEXT_BRIDGE_REMOTE")]
     pub(crate) remote: bool,
 
+    /// Offer the REST call surface: `GET /v1/describe` and `POST /v1/<service>/<method>`.
+    ///
+    /// Off by default, and not part of normal use. The plugin system and its plugins reach the
+    /// bridge over the shared WebSocket alone; `/v1/ws` and the `/v1/health` probe it opens with
+    /// are always served, so an end user never needs this. It exists so a script or an agent can
+    /// call the same services from outside the page — `curl` a service, drive `remote`, rebuild
+    /// the bundle — which is a second way in, and therefore asked for rather than assumed.
+    #[arg(long, env = "VRCNEXT_BRIDGE_REST")]
+    pub(crate) rest: bool,
+
+    /// Compile the installed plugins into the theme bundle and exit.
+    ///
+    /// The same work `plugins/build` does, without a running daemon or a way in: the installer
+    /// needs one build before VRCNext first starts, and should not have to open the REST surface
+    /// to get it.
+    #[arg(long)]
+    pub(crate) build_plugins: bool,
+
     /// Log level: error, warn, info, debug, trace.
     #[arg(long, default_value = "info", env = "VRCNEXT_BRIDGE_LOG")]
     pub(crate) log: String,

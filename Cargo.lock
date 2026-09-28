@@ -3616,6 +3616,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
  "vrcnext-bridge-core",
  "vrcnext-bridge-plugins",
  "vrcnext-bridge-sinks",

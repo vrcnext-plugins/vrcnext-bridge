@@ -178,8 +178,21 @@ pub(crate) fn log_banner(config: &Config, paths: &Paths, token: &str, services: 
         log::info!("plugin logs: {logs}");
     }
 
+    if config.rest {
+        log::warn!(
+            "REST call surface: enabled; the pairing token can call every service over POST /v1/<service>/<method>"
+        );
+    } else {
+        log::info!("REST call surface: off (--rest); the socket and /v1/health are served");
+    }
+
     if config.remote {
         log::warn!("remote control: enabled; the pairing token can run code in the page");
+        if !config.rest {
+            log::warn!(
+                "remote control: `remote/eval` is reachable over the socket only without --rest"
+            );
+        }
     }
 
     if config.allow_origins.is_empty() {

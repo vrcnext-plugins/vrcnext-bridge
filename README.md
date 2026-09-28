@@ -22,8 +22,19 @@ page  ──WebSocket──▶  vrcnext-bridge  ──gix (pure Rust, HTTPS)─�
 
 ```
 WS   /v1/ws                     one persistent socket — what the plugin system uses
+GET  /v1/health                 is it up, which version, which services — no token needed
+                                — everything below needs --rest —
+GET  /v1/describe               every service and target, in full
 POST /v1/<service>/<method>     one call — for curl and anything else that is not the page
 ```
+
+**The socket is the only way the plugin system talks to the bridge.** `/v1/ws` and the
+`/v1/health` probe the page opens with are all a normal install serves; a bridge started without
+`--rest` answers 404 on everything else, and says so by naming the flag. The REST surface is a
+second way into the same services for scripts and agents — a `curl`, an `eval` through `remote`,
+a rebuild — and a second way in is a thing to ask for rather than to leave open. The one build
+an installer needs before the daemon is even useful is `vrcnext-bridge --build-plugins`, which
+runs it in-process and exits.
 
 | Service | Does |
 | :--- | :--- |

@@ -48,6 +48,9 @@ fn main() -> Result<()> {
     let token = token::load_or_create(&paths.token_file())?;
     let wiring =
         startup::build_services(&config, &paths, std::sync::Arc::new(broadcaster.clone()))?;
+    if config.build_plugins {
+        return build_command(&wiring.services);
+    }
     startup::log_banner(&config, &paths, &token, &wiring.services);
 
     // Services and sinks are synchronous and stay that way; the runtime hands each call to a
@@ -61,6 +64,28 @@ fn main() -> Result<()> {
         .context("failed to start the runtime")?;
 
     runtime.block_on(http::serve(&config, token, wiring, broadcaster))
+}
+
+/// `--build-plugins`: compile the bundle once and stop, without opening a socket.
+///
+/// The report goes to stdout as JSON, like the service's own answer, so the installer can read
+/// it. A build that reports errors is a failed run: the installer must not go on to tell the
+/// user their plugins are ready.
+fn build_command(services: &vrcnext_bridge_core::ServiceRegistry) -> Result<()> {
+    use std::io::Write as _;
+    let report = services
+        .call("plugins", "build", serde_json::json!({}))
+        .map_err(|error| anyhow::anyhow!("{}: {error}", error.code()))?;
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{report}").context("cannot write to stdout")?;
+    let failed = report
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|errors| !errors.is_empty());
+    if failed {
+        anyhow::bail!("the bundle did not build");
+    }
+    Ok(())
 }
 
 /// `--rotate-token` / `--print-token`: write the token to stdout and stop.

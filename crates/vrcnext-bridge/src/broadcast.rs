@@ -55,6 +55,13 @@ impl Broadcaster {
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<Outbound> {
         self.sender.subscribe()
     }
+
+    /// A handle with nothing behind it, for tests that need an `AppState` and no frames.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        let (sender, _) = broadcast::channel(CHANNEL_CAPACITY);
+        Self { sender }
+    }
 }
 
 impl Pusher for Broadcaster {
