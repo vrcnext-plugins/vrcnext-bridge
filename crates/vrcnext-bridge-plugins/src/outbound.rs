@@ -47,9 +47,18 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// Longest deadline a caller may ask for.
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
 
-/// Headers the caller may not set: they describe the connection rather than the request
-/// (hop-by-hop headers, framing, the host), or identify the bridge (`user-agent`).
+/// Headers the caller may not set.
+///
+/// Three groups. Some describe the connection rather than the request (hop-by-hop headers,
+/// framing, the host). One identifies the bridge (`user-agent`). The rest carry credentials:
+/// the bridge holds a pairing token that grants everything it can do, and the page it serves
+/// holds a VRChat session, so a request leaving this machine must be unable to carry either —
+/// whether a plugin set it deliberately or a future refactor forwarded it by accident. Nothing
+/// here is a header the bridge would ever need to send on a plugin's behalf.
 const REFUSED_HEADERS: &[&str] = &[
+    "authorization",
+    "cookie",
+    "set-cookie",
     "host",
     "content-length",
     "connection",
@@ -157,6 +166,9 @@ impl HttpService {
                     .dns_resolver(Arc::new(PublicResolver))
                     // A proxy would be the one resolving the target, out of this check's sight.
                     .no_proxy()
+                    // Stated rather than assumed: a cookie jar would carry what one host set to
+                    // the next request, which is the credential leak this service must not have.
+                    .cookie_store(false)
                     .build()
                     .map_err(|error| error.to_string())
             })
