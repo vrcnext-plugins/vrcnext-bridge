@@ -3,7 +3,8 @@
 //! A plugin is compiled into the same bundle as the host and runs with the page's authority.
 //! There is no sandbox to put it in, so the next best thing is to refuse, before compiling, the
 //! handful of constructs that let code reach past the `ctx.*` API: evaluating strings, touching
-//! `window` or storage directly, opening its own sockets, loading code at runtime. A plugin that
+//! `window` (by any of its names) or storage directly, opening its own sockets or workers,
+//! loading code at runtime. A plugin that
 //! needs the network uses `ctx.http.fetch`, which the permission gate can see.
 //!
 //! This is a text scan, not a parser. It is meant to catch honest mistakes and make dishonest
@@ -60,6 +61,17 @@ enum Match {
     /// The text, preceded by something that is not an identifier character or `.`. Catches
     /// `fetch(` but not `ctx.http.fetch(` or `prefetch(`.
     Bare(&'static str),
+    /// The identifier as a whole word: not preceded by an identifier character or `.`, and not
+    /// followed by an identifier character. Catches `fetch(url)`, `(0, fetch)(url)` and
+    /// `const f = fetch`, but not `ctx.http.fetch(` or `prefetch`.
+    Word(&'static str),
+    /// The identifier as a whole word, even as a member (`self.localStorage`): not glued to an
+    /// identifier on either side, but a `.` before it does not excuse it.
+    Member(&'static str),
+    /// A name that is another spelling of `window` (`top`, `parent`, `frames`), followed by `[`
+    /// or by `.` and a member that only the window has. The member list keeps an ordinary local
+    /// called `parent` or `top` (`parent.appendChild(li)`) out of it.
+    WindowAlias(&'static str),
     /// The text anywhere.
     Anywhere(&'static str),
     /// `.innerHTML` followed by a single `=`.
@@ -77,25 +89,81 @@ pub struct Rule {
 }
 
 /// The policy. Order is the order of the docs.
+///
+/// Globals that give network, storage or code-loading reach are matched as whole words, not as
+/// calls, so taking a reference (`const f = fetch`, `(0, eval)(s)`) is refused like calling one;
+/// storage is refused even as a member (`self.localStorage`). The other names of the window —
+/// `self`, `top`, `parent`, `frames`, `opener`, `defaultView` — are refused as ways around the
+/// `window` rule, `top`/`parent`/`frames` only when used like the window so a local variable of
+/// that name stays usable. The host's own message table (`__receiveMessageCallbacks`) is never
+/// a plugin's to touch.
 pub const RULES: &[Rule] = &[
-    rule("eval", Match::Bare("eval(")),
-    rule("new Function", Match::Bare("new Function")),
-    rule("globalThis", Match::Bare("globalThis.")),
-    rule("window", Match::Bare("window.")),
+    rule("eval", Match::Word("eval")),
+    rule("Function", Match::Word("Function")),
+    rule("globalThis", Match::Word("globalThis")),
+    rule("window", Match::Word("window")),
+    rule("self", Match::Bare("self.")),
+    rule("self", Match::Bare("self[")),
+    rule("top", Match::WindowAlias("top")),
+    rule("parent", Match::WindowAlias("parent")),
+    rule("frames", Match::WindowAlias("frames")),
+    rule("opener", Match::Word("opener")),
+    rule("defaultView", Match::Member("defaultView")),
+    rule(
+        "__receiveMessageCallbacks",
+        Match::Anywhere("__receiveMessageCallbacks"),
+    ),
+    rule("Reflect.get", Match::Bare("Reflect.get(")),
     rule("document.cookie", Match::Bare("document.cookie")),
-    rule("localStorage", Match::Bare("localStorage")),
-    rule("sessionStorage", Match::Bare("sessionStorage")),
-    rule("indexedDB", Match::Bare("indexedDB")),
-    rule("XMLHttpRequest", Match::Bare("XMLHttpRequest")),
-    rule("bare fetch", Match::Bare("fetch(")),
-    rule("WebSocket", Match::Bare("WebSocket(")),
+    rule("localStorage", Match::Member("localStorage")),
+    rule("sessionStorage", Match::Member("sessionStorage")),
+    rule("indexedDB", Match::Member("indexedDB")),
+    rule("XMLHttpRequest", Match::Word("XMLHttpRequest")),
+    rule("fetch", Match::Word("fetch")),
+    rule("WebSocket", Match::Word("WebSocket")),
+    rule("EventSource", Match::Word("EventSource")),
+    rule(
+        "navigator.sendBeacon",
+        Match::Anywhere("navigator.sendBeacon"),
+    ),
+    rule("Worker", Match::Word("Worker")),
+    rule("SharedWorker", Match::Word("SharedWorker")),
+    rule("importScripts", Match::Word("importScripts")),
     rule("dynamic import", Match::Bare("import(")),
     rule("script tag", Match::Anywhere("<script")),
     rule("innerHTML assignment", Match::InnerHtmlAssign),
     rule("insertAdjacentHTML", Match::Anywhere("insertAdjacentHTML")),
     rule("setTimeout with a string", Match::StringTimeout),
-    rule("require", Match::Bare("require(")),
+    rule("require", Match::Word("require")),
     rule("process", Match::Bare("process.")),
+];
+
+/// Members only the window object has, which make `top.x` / `parent.x` / `frames.x` a window
+/// access rather than a local variable's.
+const WINDOW_MEMBERS: &[&str] = &[
+    "window",
+    "self",
+    "top",
+    "parent",
+    "frames",
+    "opener",
+    "document",
+    "location",
+    "history",
+    "navigator",
+    "postMessage",
+    "globalThis",
+    "eval",
+    "Function",
+    "fetch",
+    "XMLHttpRequest",
+    "WebSocket",
+    "EventSource",
+    "localStorage",
+    "sessionStorage",
+    "indexedDB",
+    "open",
+    "__receiveMessageCallbacks",
 ];
 
 const fn rule(name: &'static str, matcher: Match) -> Rule {
@@ -352,6 +420,21 @@ fn matches(matcher: Match, line: &str) -> bool {
     match matcher {
         Match::Anywhere(needle) => line.contains(needle),
         Match::Bare(needle) => find_bare(line, needle).is_some(),
+        Match::Word(word) => find_word(line, word, false).is_some(),
+        Match::Member(word) => find_word(line, word, true).is_some(),
+        Match::WindowAlias(name) => find_all(line, name).any(|end| {
+            if !is_word_at(line, end.saturating_sub(name.len()), end, false) {
+                return false;
+            }
+            let rest = line.get(end..).unwrap_or("").trim_start();
+            if rest.starts_with('[') {
+                return true;
+            }
+            rest.strip_prefix('.').is_some_and(|rest| {
+                let member: &str = rest.split(|c: char| !is_ident_char(c)).next().unwrap_or("");
+                WINDOW_MEMBERS.contains(&member)
+            })
+        }),
         Match::InnerHtmlAssign => find_all(line, ".innerHTML").any(|end| {
             let rest = line.get(end..).unwrap_or("").trim_start();
             rest.starts_with('=') && !rest.starts_with("==")
@@ -373,6 +456,26 @@ fn find_bare(line: &str, needle: &str) -> Option<usize> {
         let before = line.get(..start).and_then(|s| s.chars().next_back());
         !before.is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.'))
     })
+}
+
+/// Byte offset just past the first whole-word occurrence of `word`. With `after_dot`, a `.`
+/// before it does not disqualify it.
+fn find_word(line: &str, word: &str, after_dot: bool) -> Option<usize> {
+    find_all(line, word)
+        .find(|&end| is_word_at(line, end.saturating_sub(word.len()), end, after_dot))
+}
+
+/// Whether `line[start..end]` stands alone: no identifier character on either side, and no `.`
+/// before it unless `after_dot`.
+fn is_word_at(line: &str, start: usize, end: usize, after_dot: bool) -> bool {
+    let before = line.get(..start).and_then(|s| s.chars().next_back());
+    let after = line.get(end..).and_then(|s| s.chars().next());
+    !before.is_some_and(|c| is_ident_char(c) || (!after_dot && c == '.'))
+        && !after.is_some_and(is_ident_char)
+}
+
+const fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '$')
 }
 
 /// End offsets of every occurrence of `needle`.
@@ -414,26 +517,93 @@ mod tests {
     #[test]
     fn rule_eval() {
         assert_eq!(hit("eval('1')"), "eval");
+        assert_eq!(hit("(0, eval)(s)"), "eval");
         clean("retrieval(x)");
+        clean("const evaluation = 1");
     }
 
     #[test]
-    fn rule_new_function() {
+    fn rule_function() {
+        assert_eq!(hit("const f = new Function('a', 'return a')"), "Function");
+        assert_eq!(hit("const F = Function; F('return 1')"), "Function");
+        clean("export function f() {}");
+        clean("const Functional = 1");
+    }
+
+    #[test]
+    fn rule_self() {
+        assert_eq!(hit("self.postMessage(x)"), "self");
+        assert_eq!(hit("self['fetch'](u)"), "self");
+        clean("const me = self()?.id");
+        clean("this.self.x");
+    }
+
+    #[test]
+    fn rule_window_aliases() {
+        assert_eq!(hit("top.location.href = u"), "top");
+        assert_eq!(hit("parent.postMessage(m, '*')"), "parent");
+        assert_eq!(hit("parent['document']"), "parent");
+        assert_eq!(hit("frames.window.x"), "frames");
+        clean("parent.appendChild(li)");
+        clean("const top = rect.top; top.toFixed(1)");
+        clean("style.top = '3px'");
+    }
+
+    #[test]
+    fn rule_opener() {
+        assert_eq!(hit("const w = opener"), "opener");
+        clean("ctx.opener()");
+    }
+
+    #[test]
+    fn rule_default_view() {
+        assert_eq!(hit("el.ownerDocument.defaultView.fetch(u)"), "defaultView");
+    }
+
+    #[test]
+    fn rule_receive_message_callbacks() {
         assert_eq!(
-            hit("const f = new Function('a', 'return a')"),
-            "new Function"
+            hit("x.__receiveMessageCallbacks.push(f)"),
+            "__receiveMessageCallbacks"
         );
+    }
+
+    #[test]
+    fn rule_reflect_get() {
+        assert_eq!(hit("Reflect.get(o, 'fetch')"), "Reflect.get");
+    }
+
+    #[test]
+    fn rule_event_source() {
+        assert_eq!(hit("new EventSource('/s')"), "EventSource");
+    }
+
+    #[test]
+    fn rule_send_beacon() {
+        assert_eq!(hit("navigator.sendBeacon(u, d)"), "navigator.sendBeacon");
+    }
+
+    #[test]
+    fn rule_workers() {
+        assert_eq!(hit("new Worker(url)"), "Worker");
+        assert_eq!(hit("new SharedWorker(url)"), "SharedWorker");
+        assert_eq!(hit("importScripts(u)"), "importScripts");
+        clean("const ServiceWorkerish = 1");
     }
 
     #[test]
     fn rule_global_this() {
         assert_eq!(hit("globalThis.foo = 1"), "globalThis");
+        assert_eq!(hit("globalThis['fe' + 'tch'](u)"), "globalThis");
+        assert_eq!(hit("const g = globalThis"), "globalThis");
     }
 
     #[test]
     fn rule_window() {
         assert_eq!(hit("const h = window.location.href"), "window");
+        assert_eq!(hit("const w = window; w['fetch'](u)"), "window");
         clean("ctx.window.open()");
+        clean("const windowSize = 3");
     }
 
     #[test]
@@ -444,6 +614,7 @@ mod tests {
     #[test]
     fn rule_local_storage() {
         assert_eq!(hit("localStorage.setItem('a', 'b')"), "localStorage");
+        assert_eq!(hit("const s = globalObj.localStorage"), "localStorage");
     }
 
     #[test]
@@ -463,9 +634,12 @@ mod tests {
 
     #[test]
     fn rule_bare_fetch() {
-        assert_eq!(hit("await fetch('https://x')"), "bare fetch");
+        assert_eq!(hit("await fetch('https://x')"), "fetch");
+        assert_eq!(hit("(0, fetch)(url)"), "fetch");
+        assert_eq!(hit("const f = fetch"), "fetch");
         clean("await ctx.http.fetch('https://x')");
         clean("prefetch(url)");
+        clean("fetchStars(ctx)");
     }
 
     #[test]
@@ -513,6 +687,8 @@ mod tests {
     #[test]
     fn rule_require() {
         assert_eq!(hit("const fs = require('fs')"), "require");
+        assert_eq!(hit("const r = require"), "require");
+        clean("const required = true");
     }
 
     #[test]
