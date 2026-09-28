@@ -3,10 +3,6 @@
 name: release
 
 on:
-  push:
-    tags: ['v*']
-  # Manual runs create the tag and release from the checked-out commit, for environments that can
-  # push branches but not tags.
   workflow_dispatch:
     inputs:
       version:
@@ -14,6 +10,12 @@ on:
         required: true
         type: string
 
+  # Disabled: workflows do not run under this account, so an automatic trigger here would
+  # never fire. Uncomment if you fork this repository onto an account where Actions run.
+  #   push:
+  #     tags: ['v*']
+  #   # Manual runs create the tag and release from the checked-out commit, for environments that can
+  #   # push branches but not tags.
 permissions:
   contents: write
 
