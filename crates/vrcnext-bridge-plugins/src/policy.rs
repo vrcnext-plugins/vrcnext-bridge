@@ -32,8 +32,11 @@ const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mj
 /// They are exempt because their whole job is to *name* the things the rules below ban: a lint
 /// config that forbids `localStorage` has to write the word down, and refusing the file that
 /// enforces the policy would be absurd. The exemption is narrow — exact names, root only — and
-/// [`imports_exempt_file`] refuses any source that imports one, so nothing can be smuggled into
-/// the bundle through a name on this list.
+/// nothing can be smuggled into the bundle through a name on this list: [`imports_exempt_file`]
+/// refuses any source that imports one (in any letter case), and [`json_maps_exempt_file`]
+/// refuses a `package.json` or tsconfig that maps a specifier onto one. The bundler has no
+/// switch that would do this for us — esbuild's `--external` matches the specifier as written,
+/// not the file it resolves to — so these two checks are the whole defence.
 const EXEMPT_ROOT_FILES: &[&str] = &[
     "eslint.config.js",
     "eslint.config.mjs",
@@ -133,7 +136,23 @@ pub enum PolicyError {
 /// The first [`PolicyError`] found. Files are visited in sorted order so the answer is stable.
 pub fn scan_tree(root: &Path) -> Result<(), PolicyError> {
     let mut files = Vec::new();
-    collect(root, root, &mut files)?;
+    let mut manifests = Vec::new();
+    collect(root, root, &mut files, &mut manifests)?;
+    for path in manifests {
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let bytes = std::fs::read(&path).map_err(|_| PolicyError::Io(relative.clone()))?;
+        if let Some(line) = json_maps_exempt_file(&relative, &String::from_utf8_lossy(&bytes)) {
+            return Err(PolicyError::Violation {
+                file: relative,
+                line,
+                rule: "references a tooling config",
+            });
+        }
+    }
     if files.len() > MAX_SOURCE_FILES {
         return Err(PolicyError::TooManyFiles);
     }
@@ -165,9 +184,15 @@ pub fn scan_tree(root: &Path) -> Result<(), PolicyError> {
     Ok(())
 }
 
-/// Walk `dir`, appending source files. `.git` is skipped: it is not compiled. Symlinks are
-/// refused outright rather than followed, so nothing outside the clone can be read or bundled.
-fn collect(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), PolicyError> {
+/// Walk `dir`, appending source files to `out` and JSON files to `json`. `.git` is skipped: it
+/// is not compiled. Symlinks are refused outright rather than followed, so nothing outside the
+/// clone can be read or bundled.
+fn collect(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    json: &mut Vec<PathBuf>,
+) -> Result<(), PolicyError> {
     let relative = |path: &Path| {
         path.strip_prefix(root)
             .unwrap_or(path)
@@ -190,7 +215,12 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Policy
             if path.file_name().is_some_and(|name| name == ".git") {
                 continue;
             }
-            collect(root, &path, out)?;
+            collect(root, &path, out, json)?;
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
+            json.push(path);
         } else if is_source(&path) {
             if (dir == root && is_exempt(&path)) || is_exempt_path(root, &path) {
                 continue;
@@ -230,11 +260,16 @@ fn is_exempt_path(root: &Path, path: &Path) -> bool {
 /// the signing tool is the thing every plugin's own comments and README tell an author to run,
 /// and a policy that refused a repository for explaining itself would be absurd.
 fn imports_exempt_file(text: &str) -> Option<&'static str> {
+    let lower = text.to_ascii_lowercase();
+    exempt_names().find(|name| is_specifier(&lower, name))
+}
+
+/// Every exempt file by its bare name, which is what a specifier or a mapping ends in.
+fn exempt_names() -> impl Iterator<Item = &'static str> {
     EXEMPT_ROOT_FILES
         .iter()
         .chain(EXEMPT_PATHS)
-        .copied()
-        .find(|name| is_specifier(text, name))
+        .map(|path| path.rsplit('/').next().unwrap_or(path))
 }
 
 /// Whether `name` appears in `text` as the tail of a quoted module specifier.
@@ -242,7 +277,8 @@ fn imports_exempt_file(text: &str) -> Option<&'static str> {
 /// A specifier is delimited: the name ends at the closing quote, and walking left over the path
 /// characters that can precede it (`./`, `../`, directories) must arrive at the opening one.
 /// Dynamic `import(` and `require(` are refused by [`RULES`] anyway, so a static specifier is
-/// the only way an exempt file could reach the bundle.
+/// the only way an exempt file could reach the bundle. `text` is expected lowercased: a
+/// case-insensitive filesystem resolves `./ESLint.Config.mjs` to the exempt file too.
 fn is_specifier(text: &str, name: &str) -> bool {
     const QUOTES: [char; 3] = ['\'', '"', '`'];
     text.match_indices(name).any(|(at, _)| {
@@ -255,6 +291,38 @@ fn is_specifier(text: &str, name: &str) -> bool {
         });
         before.ends_with(QUOTES)
     })
+}
+
+/// The 1-based line on which a JSON file names an exempt file where a resolver would read it.
+///
+/// A specifier is not the only route into the bundle: a `package.json` `imports` or `browser`
+/// map, or a tsconfig `paths` entry, can point an innocent-looking specifier at an exempt file.
+/// Rather than track which fields each resolver honours, every JSON file is refused if it names
+/// one, case-insensitively, anywhere — except a `package.json`'s `scripts`, which run commands
+/// and resolve nothing, and are where the signing tool is legitimately invoked from. A file that
+/// does not parse (a tsconfig with comments, say) is searched as plain text, with no exception.
+fn json_maps_exempt_file(relative: &str, text: &str) -> Option<usize> {
+    let is_package = relative.rsplit('/').next() == Some("package.json");
+    let searched = match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(mut value) => {
+            if is_package && let Some(object) = value.as_object_mut() {
+                object.remove("scripts");
+            }
+            value.to_string()
+        }
+        Err(_) => text.to_owned(),
+    }
+    .to_ascii_lowercase();
+    let found = exempt_names().find(|name| searched.contains(name))?;
+    // A mapping names the file as a whole string, so prefer the line where it closes one; a
+    // `scripts` command mentioning it mid-string is not the line to point at.
+    let lines: Vec<String> = text.lines().map(str::to_ascii_lowercase).collect();
+    let quoted = format!("{found}\"");
+    let line = lines
+        .iter()
+        .position(|line| line.contains(&quoted))
+        .or_else(|| lines.iter().position(|line| line.contains(found)));
+    Some(line.map_or(1, |index| index + 1))
 }
 
 /// Scan one file's text.
@@ -483,15 +551,71 @@ mod tests {
         ));
         std::fs::remove_file(dir.join("src/eslint.config.mjs")).unwrap();
 
-        // Importing an exempt file would bundle it unscanned, so that is refused.
-        std::fs::write(dir.join("main.ts"), "import './eslint.config.mjs';").unwrap();
-        assert!(matches!(
-            scan_tree(&dir).unwrap_err(),
-            PolicyError::Violation {
-                rule: "references a tooling config",
-                ..
-            }
-        ));
+        // Importing an exempt file would bundle it unscanned, so that is refused, in any case.
+        for import in [
+            "import './eslint.config.mjs';",
+            "import './ESLint.Config.MJS';",
+        ] {
+            std::fs::write(dir.join("main.ts"), import).unwrap();
+            assert!(matches!(
+                scan_tree(&dir).unwrap_err(),
+                PolicyError::Violation {
+                    rule: "references a tooling config",
+                    ..
+                }
+            ));
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_resolver_mapping_cannot_point_at_an_exempt_file() {
+        let dir = scratch_dir("policy-mapping");
+        std::fs::write(dir.join("main.ts"), "import { a } from '#x';").unwrap();
+        std::fs::write(dir.join("eslint.config.mjs"), "export const a = 1;").unwrap();
+        // Running the signing tool from `scripts` is how every plugin is meant to sign itself.
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"scripts":{"sign":"node scripts/sign-plugin.mjs sign"}}"#,
+        )
+        .unwrap();
+        scan_tree(&dir).unwrap();
+
+        for (file, json) in [
+            (
+                "package.json",
+                r##"{"imports":{"#x":"./ESLINT.config.mjs"}}"##,
+            ),
+            (
+                "package.json",
+                r#"{"browser":{"./y.js":"./eslint.config.mjs"}}"#,
+            ),
+            (
+                "src/package.json",
+                r#"{"alias":{"y":"../eslint.config.mjs"}}"#,
+            ),
+            (
+                "tsconfig.json",
+                "{\n  // paths\n  \"compilerOptions\": {\"paths\": {\"x\": [\"./eslint.config.mjs\"]}}\n}",
+            ),
+        ] {
+            std::fs::remove_file(dir.join("package.json")).ok();
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(dir.join(file), json).unwrap();
+            let error = scan_tree(&dir).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    PolicyError::Violation {
+                        rule: "references a tooling config",
+                        ..
+                    }
+                ),
+                "{file}: {json} -> {error:?}"
+            );
+            std::fs::remove_file(dir.join(file)).unwrap();
+        }
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
