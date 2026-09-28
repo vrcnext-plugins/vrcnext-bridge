@@ -31,9 +31,32 @@ POST /v1/<service>/<method>     one call — for curl and anything else that is 
 | `state` | the page's key-value store (`state.json`): enabled flags, grants, plugin settings |
 | `notify` | notifications to VR overlays and the desktop, individually targetable |
 | `logs` | appends the page's log lines to a file |
+| `outbound` | one HTTP request, made by the bridge instead of the page, so APIs that send no CORS headers are reachable at all |
 
 A future OSC, clipboard or presence service registers beside them without touching the
 transport, the request guard, the rate limiter, or the wiring.
+
+### `outbound`, and what it is for
+
+A browser may only read a cross-origin response when the server says it may. Plenty of plain
+HTTP APIs never say so — the Steam Web API among them — and to a plugin they are simply
+unreachable: the request fails before a response is looked at, indistinguishable from the host
+being down. The bridge is not a browser, so a request it makes is subject to no such rule.
+
+That is more reach than the page has, and it is not narrowed here: `outbound` will fetch
+whatever this machine can fetch, this machine's own network included. The check that matters is
+in front of it, in the plugin host, which asks the user about the concrete host before a
+plugin's first request to it and names the direction — *request data from* or *send data to* —
+along with the method, the URL, the headers and the body. A declared host in `plugin.json` is
+the plugin saying where it intends to go, not the user having agreed to it.
+
+One request, `fetch`, text in and text out: a response that is not valid UTF-8 is refused rather
+than mangled. Bounded at 1 MiB sent, 16 MiB received, 32 headers and 120 seconds; `Host`,
+`Content-Length` and the other connection headers belong to the bridge and cannot be set.
+
+It is a service like the others, reached over the same socket. The `POST /v1/...` interface is
+for development and for agents driving the bridge from outside — it gains nothing here, and the
+plugin system never uses it.
 
 ## The socket
 

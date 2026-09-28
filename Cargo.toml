@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Unlicense"
@@ -11,10 +11,10 @@ repository = "https://github.com/vrcnext-plugins/vrcnext-bridge"
 authors = ["vrcnext-plugins"]
 
 [workspace.dependencies]
-vrcnext-bridge-core = { path = "crates/vrcnext-bridge-core", version = "0.3.1" }
-vrcnext-bridge-sinks = { path = "crates/vrcnext-bridge-sinks", version = "0.3.1" }
-vrcnext-bridge-plugins = { path = "crates/vrcnext-bridge-plugins", version = "0.3.1" }
-vrcnext-bridge-win = { path = "crates/vrcnext-bridge-win", version = "0.3.1" }
+vrcnext-bridge-core = { path = "crates/vrcnext-bridge-core", version = "0.4.0" }
+vrcnext-bridge-sinks = { path = "crates/vrcnext-bridge-sinks", version = "0.4.0" }
+vrcnext-bridge-plugins = { path = "crates/vrcnext-bridge-plugins", version = "0.4.0" }
+vrcnext-bridge-win = { path = "crates/vrcnext-bridge-win", version = "0.4.0" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -44,6 +44,9 @@ gix = { version = "0.88", default-features = false, features = [
 sha2 = "0.11"
 # Ed25519 verification for plugin signatures. Pure Rust, no OS crypto library.
 ed25519-dalek = { version = "3", default-features = false, features = ["fast"] }
+# Outbound HTTP for the `outbound` service. Already in the tree through gix's transport, so this
+# adds a blocking client rather than a second TLS stack.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "charset", "http2", "gzip"] }
 # Win32 bindings for the native confirmation dialog. Pure Rust, no headers.
 windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
 

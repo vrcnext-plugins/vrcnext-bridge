@@ -12,7 +12,7 @@ use vrcnext_bridge_core::{
     Approver, NullApprover, Paths, Pusher, RemoteService, Service, ServiceRegistry,
 };
 use vrcnext_bridge_plugins::{
-    Builder, EsbuildBuilder, Git, GixGit, PluginsService, StateService, StateStore,
+    Builder, EsbuildBuilder, Git, GixGit, HttpService, PluginsService, StateService, StateStore,
 };
 use vrcnext_bridge_sinks::WayvrSink;
 
@@ -59,6 +59,7 @@ pub(crate) fn build_services(
     registry.register(Arc::new(NotifyService::new(build_sinks(config))) as Arc<dyn Service>);
     registry.register(Arc::new(LogService::new(Arc::clone(&log_writer))) as Arc<dyn Service>);
     registry.register(Arc::new(StateService::new(state)) as Arc<dyn Service>);
+    registry.register(Arc::new(HttpService::new()) as Arc<dyn Service>);
     registry.register(Arc::new(plugins) as Arc<dyn Service>);
 
     Ok(Wiring {
