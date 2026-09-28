@@ -99,13 +99,14 @@ fn router(rest: bool, state: Arc<AppState>, guard: Arc<Guard>) -> Router {
         .with_state(state)
 }
 
-async fn health(State(state): State<Arc<AppState>>) -> Response {
+/// `GET /v1/health` — unauthenticated, so it says only that the bridge is up and which version.
+/// What the bridge can do is for a paired caller: `/v1/describe` and the socket's welcome frame.
+async fn health() -> Response {
     json(
         200,
         &serde_json::json!({
             "ok": true,
             "version": crate::VERSION,
-            "services": state.services.services().map(|service| service.name()).collect::<Vec<_>>(),
         }),
     )
 }

@@ -118,3 +118,28 @@ async fn the_refusal_names_the_flag_rather_than_looking_like_a_typo() {
     let text = body_of(false, "POST", "/v1/plugins/build").await;
     assert!(text.contains("--rest"), "{text}");
 }
+
+#[tokio::test]
+async fn the_probe_names_no_services_without_a_token() {
+    let response = app(false)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/health")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(body["ok"], true);
+    assert!(body["version"].is_string());
+    assert_eq!(
+        body.as_object().map(serde_json::Map::len),
+        Some(2),
+        "{body}"
+    );
+}
