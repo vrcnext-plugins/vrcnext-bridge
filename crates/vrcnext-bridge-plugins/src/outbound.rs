@@ -47,14 +47,20 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// Longest deadline a caller may ask for.
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
 
-/// Headers the caller may not set: they describe the connection, not the request.
+/// Headers the caller may not set: they describe the connection rather than the request
+/// (hop-by-hop headers, framing, the host), or identify the bridge (`user-agent`).
 const REFUSED_HEADERS: &[&str] = &[
     "host",
     "content-length",
     "connection",
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authorization",
+    "te",
+    "trailer",
     "transfer-encoding",
     "upgrade",
-    "proxy-authorization",
+    "user-agent",
 ];
 
 /// Why an `outbound` call was refused.

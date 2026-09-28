@@ -60,6 +60,12 @@ fn connection_headers_belong_to_the_bridge() {
         "Connection",
         "Transfer-Encoding",
         "Upgrade",
+        "User-Agent",
+        "TE",
+        "Trailer",
+        "Keep-Alive",
+        "Proxy-Connection",
+        "Proxy-Authorization",
     ] {
         assert!(
             matches!(check_header(name, "x"), Err(HttpError::BadHeader(_))),
