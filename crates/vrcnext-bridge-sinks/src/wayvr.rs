@@ -212,7 +212,7 @@ impl Sink for WayvrSink {
     /// [`SinkHealth::Up`] if some local socket holds the target port, [`SinkHealth::Down`] if
     /// nothing does, or [`SinkHealth::Unknown`] where that cannot be determined.
     ///
-    /// See [`WayvrSink::is_listener_bound`] for what this genuinely proves — the negative is
+    /// See `is_listener_bound` (private) for what this genuinely proves — the negative is
     /// trustworthy, the positive is only "the port is taken".
     fn health(&self) -> SinkHealth {
         #[cfg(target_os = "linux")]

@@ -14,7 +14,10 @@ echo "== test =="
 cargo test --workspace
 
 echo "== doc =="
-cargo doc --workspace --no-deps
+# A broken or private intra-doc link is a warning by default, and `cargo doc` exits 0 on it —
+# which is how one sat in the tree unnoticed. The gate does not filter output, so it must not
+# tolerate it either.
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 echo "== release =="
 cargo build --release
