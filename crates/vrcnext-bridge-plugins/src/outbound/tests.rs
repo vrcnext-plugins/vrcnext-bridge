@@ -12,6 +12,7 @@ use vrcnext_bridge_core::Service;
 
 use super::{
     HttpError, HttpService, MAX_HEADERS, MAX_REQUEST_BYTES, check_header, parse_method, parse_url,
+    read_capped,
 };
 
 #[test]
@@ -141,5 +142,19 @@ fn describe_states_that_redirects_are_not_followed() {
         described["redirects"]
             .as_str()
             .is_some_and(|text| text.starts_with("not followed"))
+    );
+}
+
+#[test]
+fn a_body_is_refused_once_it_passes_the_cap_while_streaming() {
+    assert_eq!(read_capped(&b"abcd"[..], 4).ok(), Some(b"abcd".to_vec()));
+    assert_eq!(
+        read_capped(&b"abcde"[..], 4).err(),
+        Some(HttpError::ResponseTooLarge)
+    );
+    // An endless source ends at the cap plus one, rather than filling memory.
+    assert_eq!(
+        read_capped(std::io::repeat(b'x'), 1024).err(),
+        Some(HttpError::ResponseTooLarge)
     );
 }

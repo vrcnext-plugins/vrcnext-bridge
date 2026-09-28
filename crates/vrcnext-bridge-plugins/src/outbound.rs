@@ -18,6 +18,7 @@
 //! mangled: the plugin API is JSON end to end, and a binary payload has nowhere to go in it.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -25,7 +26,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use vrcnext_bridge_core::{Service, ServiceError};
 
-/// Largest response body accepted, before decompression is accounted for.
+/// Largest response body accepted, counted after decompression.
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Largest request body accepted.
@@ -246,13 +247,10 @@ fn read_response(response: reqwest::blocking::Response) -> Result<Value, HttpErr
     if response.content_length().is_some_and(|len| len > cap) {
         return Err(HttpError::ResponseTooLarge);
     }
-    let bytes = response
-        .bytes()
-        .map_err(|error| HttpError::Failed(error.to_string()))?;
-    if bytes.len() > MAX_RESPONSE_BYTES {
-        return Err(HttpError::ResponseTooLarge);
-    }
-    let body = String::from_utf8(bytes.to_vec()).map_err(|_| HttpError::NotText)?;
+    // The body is streamed through a limit one byte past the cap, after decompression: a body
+    // that reaches the extra byte is refused, and nothing beyond it is ever buffered.
+    let bytes = read_capped(response, MAX_RESPONSE_BYTES)?;
+    let body = String::from_utf8(bytes).map_err(|_| HttpError::NotText)?;
     Ok(json!({
         "status": status.as_u16(),
         "statusText": status.canonical_reason().unwrap_or(""),
@@ -261,6 +259,22 @@ fn read_response(response: reqwest::blocking::Response) -> Result<Value, HttpErr
         "headers": Value::Object(headers),
         "body": body,
     }))
+}
+
+/// Reads `reader` to its end, refusing it once it yields more than `cap` bytes.
+///
+/// At most `cap + 1` bytes are ever read, however long the source is.
+pub(crate) fn read_capped(reader: impl Read, cap: usize) -> Result<Vec<u8>, HttpError> {
+    let limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
+    let mut bytes = Vec::new();
+    reader
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| HttpError::Failed(error.to_string()))?;
+    if bytes.len() > cap {
+        return Err(HttpError::ResponseTooLarge);
+    }
+    Ok(bytes)
 }
 
 impl Service for HttpService {
