@@ -149,17 +149,21 @@ fn build_sinks(config: &Config) -> SinkSet {
 }
 
 /// Log exactly what is running: which services, which sinks, where the data lives, how installs
-/// are confirmed, and the pairing token.
+/// are confirmed, and where the pairing token is.
 ///
 /// Deliberately explicit. A bridge that silently came up with zero sinks, or with no way to
 /// confirm an install, is the kind of thing someone should see in the first ten lines of output
-/// rather than discover later. The token is printed on every start because the banner is where
-/// a user goes to find it: the alternative is a file path they have to know about.
-pub(crate) fn log_banner(config: &Config, paths: &Paths, token: &str, services: &ServiceRegistry) {
+/// rather than discover later. The token itself is **not** logged: this output goes to the
+/// systemd journal and to log files that are kept and shared far more freely than a `0600` file,
+/// and the token is everything the bridge can do. The banner says how to get it instead.
+pub(crate) fn log_banner(config: &Config, paths: &Paths, services: &ServiceRegistry) {
     log::info!("vrcnext-bridge {}", crate::VERSION);
     log::info!("data directory: {}", paths.root().display());
     log::info!("theme directory: {}", paths.theme_dir().display());
-    log::info!("pairing token: {token}  (paste this into the Plugins tab)");
+    log::info!(
+        "pairing token: in {} (run `vrcnext-bridge --print-token` and paste it into the Plugins tab)",
+        paths.token_file().display()
+    );
 
     for service in services.services() {
         log::info!("service `{}`: {}", service.name(), service.summary());

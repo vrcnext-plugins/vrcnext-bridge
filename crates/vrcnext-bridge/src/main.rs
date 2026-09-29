@@ -51,7 +51,7 @@ fn main() -> Result<()> {
     if config.build_plugins {
         return build_command(&wiring.services);
     }
-    startup::log_banner(&config, &paths, &token, &wiring.services);
+    startup::log_banner(&config, &paths, &wiring.services);
 
     // Services and sinks are synchronous and stay that way; the runtime hands each call to a
     // blocking thread. The async runtime exists for the transport: many idle sockets, each

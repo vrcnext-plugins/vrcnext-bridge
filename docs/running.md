@@ -11,8 +11,8 @@ shows "not detected" and nothing else.
 ```
 
 The startup banner states exactly what came up: each service, each sink and its health, the data
-and theme directories, the pairing token, which confirmation prompt is active, and the rate
-limit. If a sink is missing, the reason is on the line above.
+and theme directories, where the pairing token is (never the token itself: the banner ends up in
+the journal), which confirmation prompt is active, and the rate limit. If a sink is missing, the reason is on the line above.
 
 The first run creates `~/.vrcnext-plugins/` (`%LOCALAPPDATA%\vrcnext-plugins\` on Windows). The
 installer fills `bin/esbuild`, `bin/esbuild.sha256` and `host/`; without them `plugins/build`
@@ -21,8 +21,8 @@ answers with `ok: false` and says which is missing.
 ## The pairing token
 
 The first start writes `~/.vrcnext-plugins/token` (`%LOCALAPPDATA%\vrcnext-plugins\token` on
-Windows), readable only by you. The page needs it once: paste it into the Plugins tab. To see it
-again without the banner, or to revoke it:
+Windows), readable only by you. The page needs it once: paste it into the Plugins tab. To see it,
+or to revoke it:
 
 ```bash
 vrcnext-bridge --print-token     # prints it and exits

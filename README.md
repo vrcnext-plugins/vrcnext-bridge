@@ -43,8 +43,11 @@ runs it in-process and exits.
 | `notify` | notifications to VR overlays and the desktop, individually targetable |
 | `logs` | appends the page's log lines to a file |
 | `outbound` | one HTTP request, made by the bridge instead of the page, so APIs that send no CORS headers are reachable at all |
+| `osc` | send and receive OSC on loopback, for hosts where VRCNext's own OSC is unavailable |
+| `sql` | read VRCNext's SQLite databases by alias (never by path); one bound statement per call, no `ATTACH` |
+| `remote` | only with `--dev`: evaluate a snippet inside the paired page — see [Remote control](docs/running.md#remote-control) |
 
-A future OSC, clipboard or presence service registers beside them without touching the
+A future clipboard or presence service registers beside them without touching the
 transport, the request guard, the rate limiter, or the wiring.
 
 ### `outbound`, and what it is for
@@ -54,9 +57,11 @@ HTTP APIs never say so — the Steam Web API among them — and to a plugin they
 unreachable: the request fails before a response is looked at, indistinguishable from the host
 being down. The bridge is not a browser, so a request it makes is subject to no such rule.
 
-That is more reach than the page has, and it is not narrowed here: `outbound` will fetch
-whatever this machine can fetch, this machine's own network included. The check that matters is
-in front of it, in the plugin host, which asks the user about the concrete host before a
+That is more reach than the page has in one direction, and less in another: `outbound` reaches
+public addresses only. Loopback, private (RFC 1918, `fc00::/7`), link-local (including the cloud
+metadata address), shared/CGNAT and the other non-public ranges are refused in the resolver, so a
+DNS name that re-points at this machine or its network is refused too. It follows no redirects
+and uses no proxy. The check that matters is in front of it, in the plugin host, which asks the user about the concrete host before a
 plugin's first request to it and names the direction — *request data from* or *send data to* —
 along with the method, the URL, the headers and the body. A declared host in `plugin.json` is
 the plugin saying where it intends to go, not the user having agreed to it.
@@ -106,8 +111,9 @@ guessing is slow. After `welcome`:
 ```
 
 `id` is caller-chosen, up to 128 characters. Service and method names are lowercase identifiers
-of up to 64 characters. A request over the socket draws from the same rate-limit bucket as an HTTP
-call, so switching transports buys nothing; log frames have their own, far larger, budget.
+of up to 64 characters. Each authenticated socket has its own rate-limit bucket (the configured
+`--rate`/`--burst`), so traffic it did not send — another site pointing requests at the port —
+can never slow it; log frames have their own, far larger, budget.
 
 ## Plugins
 
@@ -125,11 +131,21 @@ at each step (`awaiting_confirmation`, `clone`, `validate`, `policy`, `signature
    file, ≤ 200 files and ≤ 2 MiB in total, no symlinks. One hit refuses the install with
    `file:line rule`. The rules, in `crates/vrcnext-bridge-plugins/src/policy.rs`, each with a
    unit test: `eval(`, `new Function`, `globalThis.`, `window.` (no exceptions, not even
-   `window.location.href`), `document.cookie`, `localStorage`, `sessionStorage`, `indexedDB`,
-   `XMLHttpRequest`, bare `fetch(` (`ctx.http.fetch(` is fine), `WebSocket(`, dynamic `import(`,
-   `<script`, `.innerHTML =`, `insertAdjacentHTML`, `setTimeout(` with a string first argument,
-   `require(`, `process.`. Plugins reach the world only through `ctx.*`. This is a text scan
-   that makes honest mistakes visible; it is not a sandbox and does not claim to be.
+   `window.location.href`), `document.cookie`, `document[`, `document.location`,
+   `location.href`, `location.assign(`, `localStorage`, `sessionStorage`, `indexedDB`,
+   `XMLHttpRequest`, bare `fetch(` (`ctx.http.fetch(` is fine), `WebSocket(`, `sendBeacon`,
+   dynamic `import(` however it is spaced, `<script`, `.innerHTML =`/`+=`, `.outerHTML =`/`+=`,
+   `insertAdjacentHTML`, `srcdoc`, `createElement` of `script`/`iframe`/`frame`/`object`/`embed`,
+   `.constructor` (the way to a `Function` constructor without writing the word),
+   `setTimeout(`/`setInterval(` with a string first argument, `require(`, `process.`, and any
+   import specifier that leaves the plugin's own directory (`../` past its root, an absolute
+   path, a `data:` or `file:` URL) or names a test file. This is a text scan that makes honest
+   mistakes visible; it is not a sandbox and does not claim to be — an `<img>` whose `src` a
+   plugin sets still reaches the network.
+
+   Test files (`*.test.*`, `*.spec.*`) are not scanned: a fake of `ctx.http` has to write
+   `fetch`. They can never reach the bundle — nothing may import one, and the build refuses a
+   bundle that has one among its inputs.
 
    Before those names, the same pass applies the **shape** rules in
    `crates/vrcnext-bridge-plugins/src/obfuscation.rs`, because a table of names only works on
@@ -150,17 +166,29 @@ at each step (`awaiting_confirmation`, `clone`, `validate`, `policy`, `signature
    in `crates/vrcnext-bridge-plugins/src/signing.rs` and the plugin system's
    `scripts/sign-plugin.mjs`.
 6. **Move** the clone to `plugins/<id>` (refused if it exists), record
-   `{url, commit, keyId, installedAt, updatedAt}` in the state store's reserved `bridge.plugins`
-   namespace, push `plugins` with the new list, and **build**.
+   `{url, commit, keyId, signedAt, installedAt, updatedAt}` in the state store's reserved
+   `bridge.plugins` namespace, push `plugins` with the new list, and **build**. If the bundle does
+   not build with the new plugin, it is removed again and the bundle rebuilt without it, so one
+   broken plugin cannot wedge every later build.
+
+The build itself asks esbuild for its metafile and refuses the bundle unless every input is the
+host, the generated import table, or a file inside an installed plugin's own directory — and a
+plugin's files import only each other and the plugin API. That is the authority on what a
+specifier resolved to: `import s from '../../state.json'`, the host's internal modules and
+another plugin's files are all refused there, however the specifier was spelled.
 
 Errors are `bad_request` with a stable code as the message prefix: `not_https`, `denied`,
 `approval_unavailable`, `clone_failed`, `no_manifest`, `manifest_invalid: …`,
 `policy: file:line rule`, `unsigned: …`, `already_installed`, `not_installed`, `not_trusted`,
-`invalid_id`.
+`invalid_id`, `downgrade`, `build_failed: …`.
 
 `update {id}` runs the same pipeline against the recorded URL and swaps the fresh clone in only
 once it has passed, so an update that fails validation leaves the old tree exactly as it was —
-and there is never a merge. `check_updates {}` fetches each clone's origin and returns
+and there is never a merge. It is refused as a `downgrade` when the new `version` is lower than
+the installed one or its signature is older than the installed tree's: a signature proves who
+made a tree, not that it is their latest, and an attacker who controls the repository but not the
+key could otherwise put back an old signed commit. If the bundle does not build with the update,
+the previous tree and record are put back. `check_updates {}` fetches each clone's origin and returns
 `{updates:[{id, current, latest, commitsBehind, changelog:[{commit, summary, time}]}]}` for the
 ones behind (≤ 50 changelog entries; a clone is shallow, so `commitsBehind` is "at least" when
 it reaches 50). `uninstall {id}` removes the clone, its record and its `plugin:<id>` state, and
@@ -341,7 +369,9 @@ What is done about it:
   and ranges, sink-name lengths, path-segment shape. A `Notification` can only be constructed by
   validation, so sinks never handle an unchecked value.
 - **Rate limited, on every endpoint.** A token bucket, 5/s with a burst of 10 by default, applied
-  to health checks and preflights too — `/v1/health` is cheap, but cheap times an unbounded request
+  to health checks and preflights too. Requests a browser makes for some other site (a refused
+  `Origin`, or fetch metadata without one) draw from a separate bucket, so a page in another tab
+  cannot starve VRCNext's — `/v1/health` is cheap, but cheap times an unbounded request
   rate is still a busy loop. A runaway `notify` loop is an accident that otherwise needs the user to
   take the headset off.
 - **`unsafe_code = "forbid"`**, workspace-wide, alongside clippy `pedantic` with `unwrap_used`,
