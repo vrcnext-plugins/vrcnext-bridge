@@ -1,4 +1,6 @@
-//! Enforces the same source-size limits the TypeScript side enforces with eslint.
+//! Enforces the same source-size limits the TypeScript side enforces with eslint, and the same
+//! layout: tests live in files of their own (`<module>/tests.rs`, as the TypeScript side keeps
+//! `*.test.ts`), never inline beside the code they test.
 //!
 //! Lives in a test rather than a lint because rustc has no `max-lines` equivalent; clippy's
 //! `too_many_lines` covers functions, which is why only the file limit is checked here. Walking up
@@ -65,5 +67,38 @@ fn no_source_file_exceeds_the_line_limit() {
         oversized.is_empty(),
         "source files over {MAX_LINES} lines:\n  {}",
         oversized.join("\n  ")
+    );
+}
+
+#[test]
+fn tests_live_in_their_own_files() {
+    let root = workspace_root();
+    let mut sources = Vec::new();
+    rust_sources(&root.join("crates"), &mut sources);
+    assert!(!sources.is_empty(), "found no Rust sources to check");
+
+    // An inline module opens a block; `mod tests;` pointing at `tests.rs` is the one allowed.
+    let inline: Vec<String> = sources
+        .iter()
+        .filter(|path| {
+            std::fs::read_to_string(path).is_ok_and(|text| {
+                text.lines().any(|line| {
+                    let line = line.trim_start();
+                    line.starts_with("mod tests {") || line.starts_with("mod test {")
+                })
+            })
+        })
+        .map(|path| {
+            path.strip_prefix(&root)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        })
+        .collect();
+
+    assert!(
+        inline.is_empty(),
+        "inline test modules; move each into <module>/tests.rs and declare `mod tests;`:\n  {}",
+        inline.join("\n  ")
     );
 }
