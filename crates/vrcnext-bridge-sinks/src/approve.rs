@@ -47,6 +47,37 @@ impl FreedesktopApprover {
         })
     }
 
+    /// Say that a prompt was skipped, without asking anything.
+    ///
+    /// This is what `--dev` uses in place of the question: the operation is already going
+    /// ahead, so the notification carries no buttons and expires like any other toast. Normal
+    /// urgency, because a question the user must answer and a note about what already happened
+    /// do not deserve the same interruption.
+    ///
+    /// # Errors
+    ///
+    /// The bus error. The caller logs it; a notification that could not be drawn must not stop
+    /// the operation it was describing.
+    pub fn announce(&self, request: &ApprovalRequest) -> zbus::Result<()> {
+        let proxy = Proxy::new(&self.connection, BUS_NAME, OBJECT_PATH, BUS_NAME)?;
+        let hints: std::collections::HashMap<&str, Value<'_>> =
+            [("urgency", Value::U8(1))].into_iter().collect();
+        let _id: u32 = proxy.call(
+            "Notify",
+            &(
+                APP_NAME,
+                0_u32,
+                "dialog-information",
+                format!("--dev: {} without asking", request.operation).as_str(),
+                format!("{}\n{}", request.summary, request.detail).as_str(),
+                &[] as &[&str],
+                hints,
+                0_i32,
+            ),
+        )?;
+        Ok(())
+    }
+
     fn ask(&self, request: &ApprovalRequest) -> zbus::Result<Approval> {
         let proxy = Proxy::new(&self.connection, BUS_NAME, OBJECT_PATH, BUS_NAME)?;
 

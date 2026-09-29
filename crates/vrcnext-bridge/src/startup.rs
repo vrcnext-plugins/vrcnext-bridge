@@ -9,7 +9,8 @@ use anyhow::{Context as _, Result};
 use vrcnext_bridge_core::logs::{LogService, LogWriter, NullLogWriter};
 use vrcnext_bridge_core::notify::{NotifyService, SinkSet};
 use vrcnext_bridge_core::{
-    Approver, NullApprover, OscService, Paths, Pusher, RemoteService, Service, ServiceRegistry,
+    Approver, DevApprover, NullApprover, OscService, Paths, Pusher, RemoteService, Service,
+    ServiceRegistry,
 };
 use vrcnext_bridge_plugins::{
     Builder, EsbuildBuilder, Git, GixGit, HttpService, PluginsService, SqlService, StateService,
@@ -40,7 +41,7 @@ pub(crate) fn build_services(
     let log_writer = build_log_writer(config);
     let state =
         Arc::new(StateStore::open(paths.state_file()).context("cannot open the state store")?);
-    let approver = build_approver();
+    let approver = build_approver(config.dev);
     let builder = Arc::new(EsbuildBuilder::new(paths.clone(), Arc::clone(&pusher)));
     let plugins = PluginsService::new(
         paths.clone(),
@@ -83,24 +84,46 @@ pub(crate) fn build_services(
 /// None is not fatal: the daemon still serves state, notifications and builds. It is loud in
 /// the banner, because every install will be refused until the user runs the bridge somewhere
 /// a prompt can appear.
+///
+/// `dev` replaces the question with [`DevApprover`]: nothing is asked, every skipped prompt is
+/// announced as a plain notification, and the banner says so. Only `--dev` may do that, because
+/// it hands anything that can reach the loopback API the right to put code in the page.
 #[cfg(unix)]
-fn build_approver() -> Arc<dyn Approver> {
+fn build_approver(dev: bool) -> Arc<dyn Approver> {
     match vrcnext_bridge_sinks::FreedesktopApprover::connect() {
+        Ok(approver) if dev => Arc::new(DevApprover::new(move |request| {
+            if let Err(error) = approver.announce(request) {
+                log::warn!("could not announce the skipped confirmation: {error}");
+            }
+        })),
         Ok(approver) => Arc::new(approver),
         Err(error) => {
             log::warn!("no session bus for confirmation prompts: {error}");
-            Arc::new(NullApprover)
+            // Still nothing to ask under --dev, but now nothing to announce either; the warning
+            // above and the banner are the whole record.
+            if dev {
+                Arc::new(DevApprover::new(|_| {}))
+            } else {
+                Arc::new(NullApprover)
+            }
         }
     }
 }
 
 #[cfg(windows)]
-fn build_approver() -> Arc<dyn Approver> {
+fn build_approver(dev: bool) -> Arc<dyn Approver> {
+    if dev {
+        // No session bus to announce on; the warning in `DevApprover::approve` is the record.
+        return Arc::new(DevApprover::new(|_| {}));
+    }
     Arc::new(vrcnext_bridge_win::MessageBoxApprover)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn build_approver() -> Arc<dyn Approver> {
+fn build_approver(dev: bool) -> Arc<dyn Approver> {
+    if dev {
+        return Arc::new(DevApprover::new(|_| {}));
+    }
     Arc::new(NullApprover)
 }
 
@@ -197,8 +220,9 @@ pub(crate) fn log_banner(config: &Config, paths: &Paths, services: &ServiceRegis
             "developer mode: ENABLED (--dev). Anyone holding the pairing token can call every \
              service over POST /v1/<service>/<method> and run arbitrary JavaScript inside the \
              VRCNext page through POST /v1/remote/eval, with all of the page's access: your \
-             VRChat session, installed plugins and their data. Turn it off unless you are \
-             developing."
+             VRChat session, installed plugins and their data. Installing, updating and removing \
+             plugins is not confirmed either — every prompt is skipped and only announced. Turn \
+             it off unless you are developing."
         );
     } else {
         log::info!("developer mode: off; only the socket and /v1/health are served");

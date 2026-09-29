@@ -8,6 +8,12 @@
 //! The rule is fail closed. No approver, a broken bus, a dismissed prompt or a timeout all mean
 //! the operation does not happen. [`Approval::Unavailable`] exists so the service can tell the
 //! user *why* nothing happened, but it is never a pass.
+//!
+//! [`DevApprover`] is the one exception, and it exists only under `--dev`: a developer redeploying
+//! a plugin twenty times an hour cannot answer twenty prompts, so the question is skipped and the
+//! answer is announced instead. That is a real weakening — anything that can reach the loopback
+//! API on a `--dev` bridge can install code into the page without a human — so it is never built
+//! without the flag and it says so in the banner.
 
 /// What the user is being asked to confirm.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,3 +64,41 @@ impl Approver for NullApprover {
         "none: privileged operations will be refused"
     }
 }
+
+/// Approves everything without asking, and announces what it let through.
+///
+/// Only ever built for a bridge started with `--dev`. `announce` is how the user finds out after
+/// the fact — a desktop notification with no buttons, since there is nothing left to answer. It
+/// is called before the operation runs, so the notification is on screen while the clone and the
+/// build happen rather than after they finished.
+pub struct DevApprover {
+    announce: Box<dyn Fn(&ApprovalRequest) + Send + Sync>,
+}
+
+impl DevApprover {
+    /// Wrap the way this platform tells the user what was skipped.
+    pub fn new(announce: impl Fn(&ApprovalRequest) + Send + Sync + 'static) -> Self {
+        Self {
+            announce: Box::new(announce),
+        }
+    }
+}
+
+impl Approver for DevApprover {
+    fn approve(&self, request: &ApprovalRequest) -> Approval {
+        log::warn!(
+            "--dev: {} approved without asking: {}",
+            request.operation,
+            request.summary
+        );
+        (self.announce)(request);
+        Approval::Approved
+    }
+
+    fn describe(&self) -> &'static str {
+        "none: --dev approves every privileged operation and only notifies"
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -54,7 +54,9 @@ pub mod ratelimit;
 pub mod remote;
 pub mod service;
 
-pub use approve::{APPROVAL_DEADLINE_SECS, Approval, ApprovalRequest, Approver, NullApprover};
+pub use approve::{
+    APPROVAL_DEADLINE_SECS, Approval, ApprovalRequest, Approver, DevApprover, NullApprover,
+};
 pub use envelope::{ClientMessage, EnvelopeError, Inbound, Request, ServerMessage};
 pub use logs::{LogLevel, LogRecord, LogService, LogWriter, NullLogWriter};
 pub use notify::{
