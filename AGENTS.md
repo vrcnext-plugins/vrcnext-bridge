@@ -40,3 +40,17 @@ unit) enables the REST surface and `remote/eval`.
 - Never drive VRCNext with a synthetic mouse or keyboard, and restart or reload it sparingly —
   both re-authenticate against VRChat. Inspect the page through the bridge's `remote` service
   (`vrcnext-eval '<async body>'`, bridge started with `--dev`).
+
+## Other repositories
+
+Each has its own `AGENTS.md`; read the one for any repository you change. Checkouts sit side by
+side, so the local path is a sibling directory.
+
+| Repository | Local | What it is |
+| :--- | :--- | :--- |
+| [`vrcnext-plugin-system`](https://github.com/vrcnext-plugins/vrcnext-plugin-system/blob/main/AGENTS.md) | `../vrcnext-plugin-system/AGENTS.md` | host, `@vrcnext/plugin-api`, installer, VRCNext protocol tools |
+| [`vrcnext-plugins.github.io`](https://github.com/vrcnext-plugins/vrcnext-plugins.github.io/blob/main/AGENTS.md) | `../vrcnext-plugins.github.io/AGENTS.md` | the documentation site — the only docs |
+| [`vrcnext-example-plugin`](https://github.com/vrcnext-plugins/vrcnext-example-plugin/blob/main/AGENTS.md) | `../vrcnext-example-plugin/AGENTS.md` | the template plugin; a submodule of the plugin system |
+| [`vrcnext-club-security-plugin`](https://github.com/vrcnext-plugins/vrcnext-club-security-plugin/blob/main/AGENTS.md) | `../vrcnext-club-security-plugin/AGENTS.md` | Club Security plugin |
+| [`vrcnext-bio-updater-plugin`](https://github.com/vrcnext-plugins/vrcnext-bio-updater-plugin/blob/main/AGENTS.md) | `../vrcnext-bio-updater-plugin/AGENTS.md` | Bio Updater plugin |
+| [`vrcnext-patches-plugin`](https://github.com/vrcnext-plugins/vrcnext-patches-plugin/blob/main/AGENTS.md) | `../vrcnext-patches-plugin/AGENTS.md` | VRCNext Patches plugin |
