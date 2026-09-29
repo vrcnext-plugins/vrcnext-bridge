@@ -20,6 +20,11 @@
 //! `SQLITE_OPEN_READ_ONLY` *and* sets `query_only`, so a statement that got past the parse checks
 //! still cannot write.
 //!
+//! An alias is only a boundary if a statement cannot name a second file itself. `ATTACH
+//! DATABASE '/any/path' AS x` would do exactly that, so every connection is opened with the
+//! attached-database limit at zero (and without URI filenames), and `ATTACH` fails whatever it
+//! names.
+//!
 //! # Sharing the file with VRCNext
 //!
 //! VRCNext holds these databases open and writes to them while the bridge reads. That is safe in
@@ -215,11 +220,15 @@ impl SqlService {
         let flags = match access {
             // No `CREATE`: this service never brings a database into being, so a typo in a
             // registered path fails loudly instead of serving an empty file.
-            Access::Read => OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-            Access::Write => OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
+            Access::Read => OpenFlags::SQLITE_OPEN_READ_ONLY,
+            Access::Write => OpenFlags::SQLITE_OPEN_READ_WRITE,
         };
         let connection =
             Connection::open_with_flags(&path, flags).map_err(|error| sqlite(&error))?;
+        // No second database, ever: see the module docs.
+        connection
+            .set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_ATTACHED, 0)
+            .map_err(|error| sqlite(&error))?;
         connection
             .busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))
             .map_err(|error| sqlite(&error))?;

@@ -186,6 +186,24 @@ fn a_read_cannot_write_even_when_the_statement_asks_to() -> Fallible {
 }
 
 #[test]
+fn a_statement_cannot_attach_a_second_database() -> Fallible {
+    let fixture = Fixture::new()?;
+    let service = fixture.service();
+    // A file the alias does not name, which ATTACH would otherwise open.
+    let other = fixture.dir.join("other.db");
+    rusqlite::Connection::open(&other)?.execute_batch("CREATE TABLE secret (x TEXT);")?;
+    for sql in [
+        format!("ATTACH DATABASE '{}' AS o", other.display()),
+        format!("ATTACH DATABASE 'file:{}?mode=ro' AS o", other.display()),
+    ] {
+        let error = refusal(&service, json!({ "database": "vrcnext", "sql": sql }))?;
+        assert!(error.contains("sqlite refused the statement"), "{error}");
+    }
+    assert_eq!(counted(&service)?, 3);
+    Ok(())
+}
+
+#[test]
 fn vrcnexts_own_database_refuses_execute_before_it_opens_anything() -> Fallible {
     let fixture = Fixture::new()?;
     let error = match fixture.service().call(

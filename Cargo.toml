@@ -47,7 +47,9 @@ sha2 = "0.11"
 # where a shared libsqlite is not ours to depend on, and the version is then the one the tests ran
 # against. Deliberately no `hooks` or `load_extension`: the service never runs a callback out of
 # SQLite and never loads an extension, which would be arbitrary native code from a plugin's query.
-rusqlite = { version = "0.38", features = ["bundled", "column_decltype"] }
+# `limits` is a compile-time switch, not a callback: it lets the service set ATTACHED to zero, so
+# a statement cannot open a second database file beside the one its alias names.
+rusqlite = { version = "0.38", features = ["bundled", "column_decltype", "limits"] }
 # Ed25519 verification for plugin signatures. Pure Rust, no OS crypto library.
 ed25519-dalek = { version = "3", default-features = false, features = ["fast"] }
 # Outbound HTTP for the `outbound` service. Already in the tree through gix's transport, so this
