@@ -5,11 +5,9 @@
 //! something a unit test can claim honestly — it is checked against a real host in the bridge's
 //! own end-to-end run.
 
-#![allow(clippy::indexing_slicing)]
-
 use std::collections::BTreeMap;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use vrcnext_bridge_core::Service;
 
 use super::{
@@ -200,13 +198,15 @@ fn describe_states_the_reach_it_has() {
     let described = service.describe();
     assert_eq!(service.name(), "outbound");
     assert!(
-        described["reach"]
-            .as_str()
+        described
+            .get("reach")
+            .and_then(Value::as_str)
             .is_some_and(|text| text.contains("cross-origin"))
     );
     assert!(
-        described["methods"]
-            .as_array()
+        described
+            .get("methods")
+            .and_then(Value::as_array)
             .is_some_and(|list| list.len() == 1)
     );
 }
@@ -215,8 +215,9 @@ fn describe_states_the_reach_it_has() {
 fn describe_states_that_redirects_are_not_followed() {
     let described = HttpService::new().describe();
     assert!(
-        described["redirects"]
-            .as_str()
+        described
+            .get("redirects")
+            .and_then(Value::as_str)
             .is_some_and(|text| text.starts_with("not followed"))
     );
 }

@@ -282,7 +282,6 @@ mod tests {
         clippy::unwrap_used,
         clippy::panic,
         clippy::indexing_slicing,
-        clippy::needless_pass_by_value,
         reason = "a failing assertion is how a test reports; panicking here is the point"
     )]
     use super::{Manifest, ManifestError};
@@ -307,19 +306,19 @@ mod tests {
         })
     }
 
-    fn parse(value: serde_json::Value) -> Result<Manifest, ManifestError> {
-        Manifest::parse(&serde_json::to_vec(&value).unwrap())
+    fn parse(value: &serde_json::Value) -> Result<Manifest, ManifestError> {
+        Manifest::parse(&serde_json::to_vec(value).unwrap())
     }
 
     fn patched(field: &str, value: serde_json::Value) -> Result<Manifest, ManifestError> {
         let mut m = full();
         m[field] = value;
-        parse(m)
+        parse(&m)
     }
 
     #[test]
     fn the_full_example_parses_and_round_trips() {
-        let manifest = parse(full()).unwrap();
+        let manifest = parse(&full()).unwrap();
         assert_eq!(manifest.id, "friend-alerts");
         assert_eq!(serde_json::to_value(&manifest).unwrap(), full());
     }
@@ -329,12 +328,12 @@ mod tests {
         let minimal = serde_json::json!({
             "id": "ab", "name": "n", "version": "0.0.1", "apiVersion": "0.2.0", "description": "d"
         });
-        assert!(parse(minimal).is_ok());
+        assert!(parse(&minimal).is_ok());
         for required in ["id", "name", "version", "apiVersion", "description"] {
             let mut m = full();
             m.as_object_mut().unwrap().remove(required);
             assert!(
-                matches!(parse(m), Err(ManifestError::Shape(_))),
+                matches!(parse(&m), Err(ManifestError::Shape(_))),
                 "{required}"
             );
         }
