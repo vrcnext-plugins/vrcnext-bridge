@@ -11,7 +11,7 @@
 use serde_json::{Value, json};
 use vrcnext_bridge_core::Service;
 
-use super::{DATABASES, MAX_PARAMS, SqlService, single_statement};
+use super::{DATABASES, MAX_PARAMS, MAX_STATEMENT_MS, SqlService, single_statement};
 
 type Fallible = Result<(), Box<dyn std::error::Error>>;
 type Got<T> = Result<T, Box<dyn std::error::Error>>;
@@ -308,5 +308,46 @@ fn an_unknown_method_is_refused() -> Fallible {
         Ok(answer) => return Err(format!("expected a refusal, got {answer}").into()),
     };
     assert!(error.contains("drop"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn a_statement_that_will_not_finish_is_interrupted_rather_than_left_running() -> Fallible {
+    let fixture = Fixture::new()?;
+    // A recursive CTE with no bound: it would produce rows until something stopped it, and MAX_ROWS
+    // is not that something — it caps what comes back, not what SQLite scans. The watchdog is.
+    let started = std::time::Instant::now();
+    let error = refusal(
+        &fixture.service(),
+        json!({
+            "database": "vrcnext",
+            "sql": "WITH RECURSIVE forever(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM forever) \
+                    SELECT count(*) AS n FROM forever",
+        }),
+    )?;
+    let waited = started.elapsed();
+    assert!(
+        error.contains("interrupted") || error.contains("too many rows"),
+        "it must end by the interrupt or the row cap, not by running out of memory: {error}"
+    );
+    assert!(
+        waited < std::time::Duration::from_millis(super::MAX_STATEMENT_MS + 5_000),
+        "it should have been stopped near the deadline, not {waited:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_watchdog_lets_a_finished_statement_go_without_waiting_out_its_deadline() -> Fallible {
+    let fixture = Fixture::new()?;
+    let started = std::time::Instant::now();
+    for _ in 0..5 {
+        let _ = counted(&fixture.service())?;
+    }
+    let waited = started.elapsed();
+    assert!(
+        waited < std::time::Duration::from_millis(MAX_STATEMENT_MS),
+        "five quick queries must not each pay the deadline: {waited:?}"
+    );
     Ok(())
 }
