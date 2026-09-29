@@ -63,6 +63,7 @@ pub(crate) async fn upgrade(State(state): State<Arc<AppState>>, ws: WebSocketUpg
 /// Everything one connection needs, so the frame handlers have one parameter.
 struct Session {
     state: Arc<AppState>,
+    request_limiter: RateLimiter,
     log_limiter: RateLimiter,
     replies: mpsc::Sender<ServerMessage>,
     written: u64,
@@ -103,6 +104,7 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>) {
     let mut outbound = state.broadcaster.subscribe();
     let (replies, mut inbox) = mpsc::channel(RESPONSE_QUEUE);
     let mut session = Session {
+        request_limiter: state.guard.session_limiter(),
         state,
         log_limiter: RateLimiter::new(LOG_FRAMES_PER_SECOND, LOG_FRAME_BURST),
         replies,
@@ -196,10 +198,12 @@ impl Session {
 
     /// Spawn the call and let its answer come back through the reply channel.
     ///
-    /// The request rate limit is the same bucket HTTP uses, so a page cannot sidestep it by
-    /// switching transports.
+    /// Calls are limited at the configured rate by a bucket this connection owns: the socket has
+    /// proven it holds the token, so traffic from anyone else — another site hammering the HTTP
+    /// port, say — must not be able to slow it.
     fn on_request(&self, request: Request) {
-        if let Err(refusal) = self.state.guard.check_rate() {
+        if !self.request_limiter.try_acquire() {
+            let refusal = super::guard::Refusal::RateLimited(self.request_limiter.retry_after());
             let reply = ServerMessage::error(request.id, refusal.code(), refusal.message());
             self.queue(reply);
             return;

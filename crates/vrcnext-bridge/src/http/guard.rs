@@ -165,11 +165,31 @@ impl OriginPolicy {
     }
 }
 
+/// Which rate-limit bucket a request is charged to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Caller {
+    /// An allow-listed origin, or a native client that sent no browser headers at all.
+    Trusted,
+    /// A browser request from anywhere else: an origin that is not allow-listed (which is then
+    /// refused), or a request a browser sent without an `Origin` — an `<img>` or `<link>` pointed
+    /// at the bridge from some other site, which carries `Sec-Fetch-Site` but no `Origin`.
+    Untrusted,
+}
+
 /// Everything checked before a request reaches a service.
+///
+/// There are two buckets, so that one caller cannot starve another. Any web page can make a
+/// browser send requests here, and if those drew from the same bucket as the VRCNext page, a site
+/// left open in another tab could keep the page answered with 429 indefinitely. So requests a
+/// browser sent on behalf of some other site draw from their own bucket, and an authenticated
+/// socket gets a bucket of its own for its calls (see [`Guard::session_limiter`]).
 pub(crate) struct Guard {
     origins: OriginPolicy,
     token: String,
+    rate: f64,
+    burst: u32,
     limiter: RateLimiter,
+    untrusted: RateLimiter,
 }
 
 impl Guard {
@@ -179,7 +199,34 @@ impl Guard {
         Self {
             origins: OriginPolicy::new(config.allow_origins.clone()),
             token,
+            rate: config.rate,
+            burst: config.burst,
             limiter: RateLimiter::new(config.rate, config.burst),
+            untrusted: RateLimiter::new(config.rate, config.burst),
+        }
+    }
+
+    /// A fresh bucket for one authenticated socket's calls, with the configured rate.
+    ///
+    /// Per connection, so a socket that has proven it holds the token is never slowed by traffic
+    /// it did not send. The notification sinks still see at most this rate per connection.
+    #[must_use]
+    pub(crate) fn session_limiter(&self) -> RateLimiter {
+        RateLimiter::new(self.rate, self.burst)
+    }
+
+    /// Classify a request by the headers a browser adds.
+    #[must_use]
+    pub(crate) fn caller(&self, headers: &HeaderMap) -> Caller {
+        match header(headers, header::ORIGIN) {
+            Some(origin) if self.origins.allows(origin) => Caller::Trusted,
+            Some(_) => Caller::Untrusted,
+            // No Origin. A native client sends no fetch metadata either; a browser always does,
+            // and "none" means the user typed the URL, which is not another site acting.
+            None => match header(headers, SEC_FETCH_SITE) {
+                None | Some("none" | "same-origin") => Caller::Trusted,
+                Some(_) => Caller::Untrusted,
+            },
         }
     }
 
@@ -206,11 +253,15 @@ impl Guard {
     /// # Errors
     ///
     /// [`Refusal::RateLimited`] when the bucket is empty.
-    pub(crate) fn check_rate(&self) -> Result<(), Refusal> {
-        if self.limiter.try_acquire() {
+    pub(crate) fn check_rate(&self, caller: Caller) -> Result<(), Refusal> {
+        let limiter = match caller {
+            Caller::Trusted => &self.limiter,
+            Caller::Untrusted => &self.untrusted,
+        };
+        if limiter.try_acquire() {
             Ok(())
         } else {
-            Err(Refusal::RateLimited(self.limiter.retry_after()))
+            Err(Refusal::RateLimited(limiter.retry_after()))
         }
     }
 
@@ -285,7 +336,7 @@ impl Guard {
 /// The middleware in front of every route: rate limit, origin, preflight, CORS headers.
 ///
 /// Order matters. The rate limit comes first so that a refused origin hammering the daemon still
-/// costs it tokens; the origin check second so a preflight from a bad origin is refused rather
+/// costs it tokens — its own bucket's, never the page's; the origin check second so a preflight from a bad origin is refused rather
 /// than answered; and the preflight answer third, so only an allow-listed origin ever gets its
 /// 204. The bearer token is checked per route, not here: see [`Guard::check_bearer`].
 pub(crate) async fn middleware(
@@ -301,8 +352,9 @@ pub(crate) async fn middleware(
 
     let cors = cors_headers(guard.allowed_origin(request.headers()));
 
+    let caller = guard.caller(request.headers());
     let mut response = match guard
-        .check_rate()
+        .check_rate(caller)
         .and_then(|()| guard.check_origin(request.headers()))
     {
         Err(refusal) => refuse(&refusal),
@@ -330,6 +382,9 @@ pub(crate) fn refuse(refusal: &Refusal) -> Response {
     response
 }
 
+/// Fetch metadata: which site a browser request was made on behalf of.
+const SEC_FETCH_SITE: header::HeaderName = header::HeaderName::from_static("sec-fetch-site");
+
 /// A header's value as text, or `None` if absent or not UTF-8.
 fn header(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
     headers.get(name).and_then(|value| value.to_str().ok())
@@ -344,10 +399,65 @@ mod tests {
         clippy::indexing_slicing,
         reason = "a failing assertion is how a test reports; panicking here is the point"
     )]
-    use super::OriginPolicy;
+    use axum::http::HeaderMap;
+
+    use super::{Caller, Guard, OriginPolicy};
 
     fn policy() -> OriginPolicy {
         OriginPolicy::new(vec!["https://vrcnext.example".to_owned()])
+    }
+
+    fn guard() -> Guard {
+        use clap::Parser as _;
+        let config =
+            crate::config::Config::parse_from(["vrcnext-bridge", "--rate", "1", "--burst", "3"]);
+        Guard::new(&config, "t".repeat(64))
+    }
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, value.parse().unwrap());
+        }
+        map
+    }
+
+    #[test]
+    fn callers_are_classified_by_what_the_browser_sent() {
+        let g = guard();
+        assert_eq!(g.caller(&headers(&[])), Caller::Trusted);
+        assert_eq!(
+            g.caller(&headers(&[("origin", "http://localhost:9000")])),
+            Caller::Trusted
+        );
+        assert_eq!(
+            g.caller(&headers(&[("sec-fetch-site", "none")])),
+            Caller::Trusted
+        );
+        assert_eq!(
+            g.caller(&headers(&[("origin", "https://evil.example")])),
+            Caller::Untrusted
+        );
+        // An <img> from another site: fetch metadata, no Origin.
+        assert_eq!(
+            g.caller(&headers(&[("sec-fetch-site", "cross-site")])),
+            Caller::Untrusted
+        );
+    }
+
+    #[test]
+    fn another_site_cannot_drain_the_pages_bucket() {
+        let g = guard();
+        for _ in 0..50 {
+            let _ = g.check_rate(Caller::Untrusted);
+        }
+        assert!(g.check_rate(Caller::Untrusted).is_err());
+        assert_eq!(g.check_rate(Caller::Trusted), Ok(()));
+        // And an authenticated socket has a bucket of its own, whatever HTTP did.
+        for _ in 0..50 {
+            let _ = g.check_rate(Caller::Trusted);
+        }
+        assert!(g.session_limiter().try_acquire());
     }
 
     #[test]
