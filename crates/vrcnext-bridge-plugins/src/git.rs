@@ -14,6 +14,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
 use gix::progress::Discard;
@@ -125,11 +126,17 @@ impl Git for GixGit {
 fn with_deadline<T>(op: impl FnOnce(&AtomicBool) -> Result<T, GitError>) -> Result<T, GitError> {
     let interrupt = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&interrupt);
-    std::thread::spawn(move || {
-        std::thread::sleep(NETWORK_DEADLINE);
-        flag.store(true, Ordering::Relaxed);
+    // The watchdog waits on a channel rather than sleeping, so it leaves as soon as the operation
+    // does: dropping `done` wakes it with a disconnect, and only a real timeout sets the flag.
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        if finished.recv_timeout(NETWORK_DEADLINE) == Err(RecvTimeoutError::Timeout) {
+            flag.store(true, Ordering::Relaxed);
+        }
     });
     let result = op(&interrupt);
+    drop(done);
+    let _ = watchdog.join();
     if interrupt.load(Ordering::Relaxed) && result.is_err() {
         return Err(GitError::Timeout);
     }
@@ -230,4 +237,31 @@ fn sanitise(message: &str) -> String {
         .join(" ")
         .replace('`', "'");
     truncate(&flat, 300)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        reason = "a failing assertion is how a test reports; panicking here is the point"
+    )]
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    use super::{GitError, with_deadline};
+
+    #[test]
+    fn the_watchdog_leaves_with_the_operation() {
+        // The watchdog is joined before this returns, so a quick operation must mean a quick
+        // return: a watchdog that slept out the whole deadline would hold this for minutes, and
+        // one that was never joined would leave a thread behind per clone.
+        let started = Instant::now();
+        let value = with_deadline(|interrupt| {
+            assert!(!interrupt.load(Ordering::Relaxed));
+            Ok::<_, GitError>(7)
+        })
+        .unwrap();
+        assert_eq!(value, 7);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 }
