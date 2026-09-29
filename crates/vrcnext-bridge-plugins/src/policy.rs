@@ -74,10 +74,15 @@ enum Match {
     WindowAlias(&'static str),
     /// The text anywhere.
     Anywhere(&'static str),
-    /// `.innerHTML` followed by a single `=`.
-    InnerHtmlAssign,
-    /// `setTimeout(` whose first argument starts with a quote or backtick.
-    StringTimeout,
+    /// The member (`.innerHTML`, `.outerHTML`) followed by a single `=` or by `+=`.
+    HtmlAssign(&'static str),
+    /// A timer (`setTimeout(`, `setInterval(`) whose first argument starts with a quote or
+    /// backtick, which the browser evaluates as code.
+    StringTimer(&'static str),
+    /// `import`, then optional whitespace, then `(`: a dynamic import however it is spaced.
+    DynamicImport,
+    /// `createElement(` whose argument is a quoted tag that loads or runs code of its own.
+    ActiveElement,
 }
 
 /// One rule: what to look for and what to call it in the refusal.
@@ -122,21 +127,40 @@ pub const RULES: &[Rule] = &[
     rule("fetch", Match::Word("fetch")),
     rule("WebSocket", Match::Word("WebSocket")),
     rule("EventSource", Match::Word("EventSource")),
-    rule(
-        "navigator.sendBeacon",
-        Match::Anywhere("navigator.sendBeacon"),
-    ),
+    rule("sendBeacon", Match::Member("sendBeacon")),
     rule("Worker", Match::Word("Worker")),
     rule("SharedWorker", Match::Word("SharedWorker")),
     rule("importScripts", Match::Word("importScripts")),
-    rule("dynamic import", Match::Bare("import(")),
+    rule("dynamic import", Match::DynamicImport),
     rule("script tag", Match::Anywhere("<script")),
-    rule("innerHTML assignment", Match::InnerHtmlAssign),
+    rule("innerHTML assignment", Match::HtmlAssign(".innerHTML")),
+    rule("outerHTML assignment", Match::HtmlAssign(".outerHTML")),
     rule("insertAdjacentHTML", Match::Anywhere("insertAdjacentHTML")),
-    rule("setTimeout with a string", Match::StringTimeout),
+    rule("srcdoc", Match::Member("srcdoc")),
+    rule("createElement of a code-loading tag", Match::ActiveElement),
+    rule(
+        "setTimeout with a string",
+        Match::StringTimer("setTimeout("),
+    ),
+    rule(
+        "setInterval with a string",
+        Match::StringTimer("setInterval("),
+    ),
+    rule("constructor", Match::Anywhere(".constructor")),
+    rule("constructor", Match::Anywhere("['constructor']")),
+    rule("constructor", Match::Anywhere("[\"constructor\"]")),
+    rule("constructor", Match::Anywhere("[`constructor`]")),
+    rule("document[", Match::Bare("document[")),
+    rule("document.location", Match::Anywhere("document.location")),
+    rule("location.href", Match::Bare("location.href")),
+    rule("location.assign", Match::Bare("location.assign(")),
     rule("require", Match::Word("require")),
     rule("process", Match::Bare("process.")),
 ];
+
+/// Tags whose element fetches or runs code by itself once it is in the document, so creating one
+/// is a way to the network or to evaluation that `ctx.http` never sees.
+const ACTIVE_TAGS: &[&str] = &["script", "iframe", "frame", "object", "embed"];
 
 /// Members only the window object has, which make `top.x` / `parent.x` / `frames.x` a window
 /// access rather than a local variable's.
@@ -290,13 +314,34 @@ fn collect(
         {
             json.push(path);
         } else if is_source(&path) {
-            if (dir == root && is_exempt(&path)) || is_exempt_path(root, &path) {
+            if (dir == root && is_exempt(&path))
+                || is_exempt_path(root, &path)
+                || is_test_file(&relative(&path))
+            {
                 continue;
             }
             out.push(path);
         }
     }
     Ok(())
+}
+
+/// Whether a path names a test file by the usual conventions: `a.test.ts`, `a.spec.js`.
+///
+/// Tests are not scanned: a test that fakes `ctx.http` has to write `fetch`, and a plugin that
+/// tests its network path would otherwise be refused for it. They are also never bundled, and
+/// that is enforced rather than assumed — [`scan_source`] refuses a file that imports one, and
+/// the build refuses a bundle that has one among its inputs.
+#[must_use]
+pub fn is_test_file(path: &str) -> bool {
+    let name = path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    let mut parts = name.split('.').skip(1).collect::<Vec<_>>();
+    parts.pop();
+    parts.iter().any(|part| matches!(*part, "test" | "spec"))
 }
 
 fn is_source(path: &Path) -> bool {
@@ -403,6 +448,23 @@ pub fn scan_source(file: &str, text: &str) -> Result<(), PolicyError> {
     // words they look for, so it never reaches them.
     crate::obfuscation::scan(file, text)?;
     for (index, line) in text.lines().enumerate() {
+        for specifier in specifiers(line) {
+            // `./a.test` resolves to `./a.test.ts`, so an extensionless specifier counts too.
+            let refused = if is_test_file(specifier) || is_test_file(&format!("{specifier}.ts")) {
+                Some("imports a test file")
+            } else if escapes_plugin(file, specifier) {
+                Some("import outside the plugin")
+            } else {
+                None
+            };
+            if let Some(rule) = refused {
+                return Err(PolicyError::Violation {
+                    file: file.to_owned(),
+                    line: index.saturating_add(1),
+                    rule,
+                });
+            }
+        }
         for rule in RULES {
             if matches(rule.matcher, line) {
                 return Err(PolicyError::Violation {
@@ -414,6 +476,59 @@ pub fn scan_source(file: &str, text: &str) -> Result<(), PolicyError> {
         }
     }
     Ok(())
+}
+
+/// The module specifiers on a line: a quoted string right after the word `from` or `import`.
+///
+/// Covers `import x from './a'`, `import './a'`, `export * from './a'` and the last line of a
+/// multi-line import. Dynamic `import(` and `require(` are refused by [`RULES`] already.
+fn specifiers(line: &str) -> impl Iterator<Item = &str> {
+    ["from", "import"].into_iter().flat_map(move |word| {
+        find_all(line, word).filter_map(move |end| {
+            if !is_word_at(line, end.saturating_sub(word.len()), end, false) {
+                return None;
+            }
+            let rest = line.get(end..)?.trim_start();
+            let quote = rest
+                .chars()
+                .next()
+                .filter(|c| matches!(c, '\'' | '"' | '`'))?;
+            rest.get(quote.len_utf8()..)?.split(quote).next()
+        })
+    })
+}
+
+/// Whether `specifier`, imported from the plugin-relative `file`, names something outside the
+/// plugin's own directory: an absolute path, a URL-ish scheme the bundler resolves itself, or a
+/// relative path with more `..` than the file is deep.
+///
+/// The build checks what esbuild actually resolved, which is the authority; this refuses the
+/// same thing at install time, so a plugin that would never build is never installed.
+fn escapes_plugin(file: &str, specifier: &str) -> bool {
+    let specifier = specifier.replace('\\', "/");
+    let lower = specifier.to_ascii_lowercase();
+    if specifier.starts_with('/')
+        || lower.starts_with("file:")
+        || lower.starts_with("data:")
+        || specifier.as_bytes().get(1) == Some(&b':')
+    {
+        return true;
+    }
+    if !specifier.starts_with('.') {
+        return false;
+    }
+    let mut depth = file.replace('\\', "/").matches('/').count();
+    for segment in specifier.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => match depth.checked_sub(1) {
+                Some(up) => depth = up,
+                None => return true,
+            },
+            _ => depth = depth.saturating_add(1),
+        }
+    }
+    false
 }
 
 fn matches(matcher: Match, line: &str) -> bool {
@@ -435,15 +550,43 @@ fn matches(matcher: Match, line: &str) -> bool {
                 WINDOW_MEMBERS.contains(&member)
             })
         }),
-        Match::InnerHtmlAssign => find_all(line, ".innerHTML").any(|end| {
+        Match::HtmlAssign(member) => find_all(line, member).any(|end| {
+            if line
+                .get(end..)
+                .and_then(|s| s.chars().next())
+                .is_some_and(is_ident_char)
+            {
+                return false;
+            }
             let rest = line.get(end..).unwrap_or("").trim_start();
-            rest.starts_with('=') && !rest.starts_with("==")
+            (rest.starts_with('=') && !rest.starts_with("==")) || rest.starts_with("+=")
         }),
-        Match::StringTimeout => find_bare(line, "setTimeout(").is_some_and(|end| {
+        Match::StringTimer(call) => find_bare(line, call).is_some_and(|end| {
             line.get(end..)
                 .unwrap_or("")
                 .trim_start()
                 .starts_with(['\'', '"', '`'])
+        }),
+        Match::DynamicImport => find_all(line, "import").any(|end| {
+            is_word_at(line, end.saturating_sub("import".len()), end, false)
+                && line.get(end..).unwrap_or("").trim_start().starts_with('(')
+        }),
+        Match::ActiveElement => find_all(line, "createElement(").any(|end| {
+            let rest = line.get(end..).unwrap_or("").trim_start();
+            let Some(quote) = rest
+                .chars()
+                .next()
+                .filter(|c| matches!(c, '\'' | '"' | '`'))
+            else {
+                return false;
+            };
+            let tag = rest
+                .get(quote.len_utf8()..)
+                .and_then(|inner| inner.split(quote).next())
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            ACTIVE_TAGS.contains(&tag.as_str())
         }),
     }
 }
@@ -490,402 +633,4 @@ fn find_all<'a>(line: &'a str, needle: &'a str) -> impl Iterator<Item = usize> +
 }
 
 #[cfg(test)]
-mod tests {
-    #![allow(
-        clippy::expect_used,
-        clippy::unwrap_used,
-        clippy::panic,
-        reason = "a failing assertion is how a test reports; panicking here is the point"
-    )]
-    use super::{PolicyError, scan_source, scan_tree};
-    use crate::fsutil::scratch_dir;
-
-    fn hit(text: &str) -> &'static str {
-        match scan_source("main.ts", text) {
-            Err(PolicyError::Violation { rule, line, .. }) => {
-                assert_eq!(line, 1);
-                rule
-            }
-            other => panic!("expected a violation for {text:?}, got {other:?}"),
-        }
-    }
-
-    fn clean(text: &str) {
-        assert_eq!(scan_source("main.ts", text), Ok(()), "{text:?}");
-    }
-
-    #[test]
-    fn rule_eval() {
-        assert_eq!(hit("eval('1')"), "eval");
-        assert_eq!(hit("(0, eval)(s)"), "eval");
-        clean("retrieval(x)");
-        clean("const evaluation = 1");
-    }
-
-    #[test]
-    fn rule_function() {
-        assert_eq!(hit("const f = new Function('a', 'return a')"), "Function");
-        assert_eq!(hit("const F = Function; F('return 1')"), "Function");
-        clean("export function f() {}");
-        clean("const Functional = 1");
-    }
-
-    #[test]
-    fn rule_self() {
-        assert_eq!(hit("self.postMessage(x)"), "self");
-        assert_eq!(hit("self['fetch'](u)"), "self");
-        clean("const me = self()?.id");
-        clean("this.self.x");
-    }
-
-    #[test]
-    fn rule_window_aliases() {
-        assert_eq!(hit("top.location.href = u"), "top");
-        assert_eq!(hit("parent.postMessage(m, '*')"), "parent");
-        assert_eq!(hit("parent['document']"), "parent");
-        assert_eq!(hit("frames.window.x"), "frames");
-        clean("parent.appendChild(li)");
-        clean("const top = rect.top; top.toFixed(1)");
-        clean("style.top = '3px'");
-    }
-
-    #[test]
-    fn rule_opener() {
-        assert_eq!(hit("const w = opener"), "opener");
-        clean("ctx.opener()");
-    }
-
-    #[test]
-    fn rule_default_view() {
-        assert_eq!(hit("el.ownerDocument.defaultView.fetch(u)"), "defaultView");
-    }
-
-    #[test]
-    fn rule_receive_message_callbacks() {
-        assert_eq!(
-            hit("x.__receiveMessageCallbacks.push(f)"),
-            "__receiveMessageCallbacks"
-        );
-    }
-
-    #[test]
-    fn rule_reflect_get() {
-        assert_eq!(hit("Reflect.get(o, 'fetch')"), "Reflect.get");
-    }
-
-    #[test]
-    fn rule_event_source() {
-        assert_eq!(hit("new EventSource('/s')"), "EventSource");
-    }
-
-    #[test]
-    fn rule_send_beacon() {
-        assert_eq!(hit("navigator.sendBeacon(u, d)"), "navigator.sendBeacon");
-    }
-
-    #[test]
-    fn rule_workers() {
-        assert_eq!(hit("new Worker(url)"), "Worker");
-        assert_eq!(hit("new SharedWorker(url)"), "SharedWorker");
-        assert_eq!(hit("importScripts(u)"), "importScripts");
-        clean("const ServiceWorkerish = 1");
-    }
-
-    #[test]
-    fn rule_global_this() {
-        assert_eq!(hit("globalThis.foo = 1"), "globalThis");
-        assert_eq!(hit("globalThis['fe' + 'tch'](u)"), "globalThis");
-        assert_eq!(hit("const g = globalThis"), "globalThis");
-    }
-
-    #[test]
-    fn rule_window() {
-        assert_eq!(hit("const h = window.location.href"), "window");
-        assert_eq!(hit("const w = window; w['fetch'](u)"), "window");
-        clean("ctx.window.open()");
-        clean("const windowSize = 3");
-    }
-
-    #[test]
-    fn rule_document_cookie() {
-        assert_eq!(hit("document.cookie = 'a=b'"), "document.cookie");
-    }
-
-    #[test]
-    fn rule_local_storage() {
-        assert_eq!(hit("localStorage.setItem('a', 'b')"), "localStorage");
-        assert_eq!(hit("const s = globalObj.localStorage"), "localStorage");
-    }
-
-    #[test]
-    fn rule_session_storage() {
-        assert_eq!(hit("sessionStorage.clear()"), "sessionStorage");
-    }
-
-    #[test]
-    fn rule_indexed_db() {
-        assert_eq!(hit("indexedDB.open('x')"), "indexedDB");
-    }
-
-    #[test]
-    fn rule_xml_http_request() {
-        assert_eq!(hit("new XMLHttpRequest()"), "XMLHttpRequest");
-    }
-
-    #[test]
-    fn rule_bare_fetch() {
-        assert_eq!(hit("await fetch('https://x')"), "fetch");
-        assert_eq!(hit("(0, fetch)(url)"), "fetch");
-        assert_eq!(hit("const f = fetch"), "fetch");
-        clean("await ctx.http.fetch('https://x')");
-        clean("prefetch(url)");
-        clean("fetchStars(ctx)");
-    }
-
-    #[test]
-    fn rule_web_socket() {
-        assert_eq!(hit("new WebSocket('ws://x')"), "WebSocket");
-    }
-
-    #[test]
-    fn rule_dynamic_import() {
-        assert_eq!(hit("const m = await import('./x')"), "dynamic import");
-        clean("import { a } from './x'");
-    }
-
-    #[test]
-    fn rule_script_tag() {
-        assert_eq!(hit("el.innerText = '<script>'"), "script tag");
-    }
-
-    #[test]
-    fn rule_inner_html_assignment() {
-        assert_eq!(hit("el.innerHTML = html"), "innerHTML assignment");
-        assert_eq!(hit("el.innerHTML=html"), "innerHTML assignment");
-        clean("if (el.innerHTML === '') {}");
-        clean("const s = el.innerHTML");
-    }
-
-    #[test]
-    fn rule_insert_adjacent_html() {
-        assert_eq!(
-            hit("el.insertAdjacentHTML('beforeend', s)"),
-            "insertAdjacentHTML"
-        );
-    }
-
-    #[test]
-    fn rule_set_timeout_with_a_string() {
-        assert_eq!(
-            hit("setTimeout('alert(1)', 10)"),
-            "setTimeout with a string"
-        );
-        assert_eq!(hit("setTimeout( `x`, 10)"), "setTimeout with a string");
-        clean("setTimeout(() => tick(), 10)");
-    }
-
-    #[test]
-    fn rule_require() {
-        assert_eq!(hit("const fs = require('fs')"), "require");
-        assert_eq!(hit("const r = require"), "require");
-        clean("const required = true");
-    }
-
-    #[test]
-    fn rule_process() {
-        assert_eq!(hit("process.env.HOME"), "process");
-        clean("ctx.process.list()");
-    }
-
-    #[test]
-    fn violations_carry_the_file_and_line() {
-        let err = scan_source("src/a.ts", "ok\nok\neval(x)").unwrap_err();
-        assert_eq!(err.to_string(), "src/a.ts:3 eval");
-    }
-
-    #[test]
-    fn root_tooling_configs_are_exempt_but_cannot_be_imported() {
-        let dir = scratch_dir("policy-exempt");
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("main.ts"), "export default 1;").unwrap();
-        // The lint config has to name what it bans; that must not be a violation.
-        std::fs::write(
-            dir.join("eslint.config.mjs"),
-            "export default [{ rules: { 'no-restricted-globals': ['error', 'localStorage', 'eval'] } }];",
-        )
-        .unwrap();
-        scan_tree(&dir).unwrap();
-
-        // The same name one directory down is ordinary source and is scanned.
-        std::fs::write(dir.join("src/eslint.config.mjs"), "localStorage.x").unwrap();
-        assert!(matches!(
-            scan_tree(&dir).unwrap_err(),
-            PolicyError::Violation {
-                rule: "localStorage",
-                ..
-            }
-        ));
-        std::fs::remove_file(dir.join("src/eslint.config.mjs")).unwrap();
-
-        // Importing an exempt file would bundle it unscanned, so that is refused, in any case.
-        for import in [
-            "import './eslint.config.mjs';",
-            "import './ESLint.Config.MJS';",
-        ] {
-            std::fs::write(dir.join("main.ts"), import).unwrap();
-            assert!(matches!(
-                scan_tree(&dir).unwrap_err(),
-                PolicyError::Violation {
-                    rule: "references a tooling config",
-                    ..
-                }
-            ));
-        }
-        std::fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn a_resolver_mapping_cannot_point_at_an_exempt_file() {
-        let dir = scratch_dir("policy-mapping");
-        std::fs::write(dir.join("main.ts"), "import { a } from '#x';").unwrap();
-        std::fs::write(dir.join("eslint.config.mjs"), "export const a = 1;").unwrap();
-        // Running the signing tool from `scripts` is how every plugin is meant to sign itself.
-        std::fs::write(
-            dir.join("package.json"),
-            r#"{"scripts":{"sign":"node scripts/sign-plugin.mjs sign"}}"#,
-        )
-        .unwrap();
-        scan_tree(&dir).unwrap();
-
-        for (file, json) in [
-            (
-                "package.json",
-                r##"{"imports":{"#x":"./ESLINT.config.mjs"}}"##,
-            ),
-            (
-                "package.json",
-                r#"{"browser":{"./y.js":"./eslint.config.mjs"}}"#,
-            ),
-            (
-                "src/package.json",
-                r#"{"alias":{"y":"../eslint.config.mjs"}}"#,
-            ),
-            (
-                "tsconfig.json",
-                "{\n  // paths\n  \"compilerOptions\": {\"paths\": {\"x\": [\"./eslint.config.mjs\"]}}\n}",
-            ),
-        ] {
-            std::fs::remove_file(dir.join("package.json")).ok();
-            std::fs::create_dir_all(dir.join("src")).unwrap();
-            std::fs::write(dir.join(file), json).unwrap();
-            let error = scan_tree(&dir).unwrap_err();
-            assert!(
-                matches!(
-                    error,
-                    PolicyError::Violation {
-                        rule: "references a tooling config",
-                        ..
-                    }
-                ),
-                "{file}: {json} -> {error:?}"
-            );
-            std::fs::remove_file(dir.join(file)).unwrap();
-        }
-        std::fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn the_signing_tool_is_exempt_at_its_one_path_and_nowhere_else() {
-        let dir = scratch_dir("policy-signer");
-        std::fs::create_dir_all(dir.join("scripts")).unwrap();
-        std::fs::write(dir.join("main.ts"), "export default 1;").unwrap();
-        // It runs under Node at release time and has to name `process`; the page never sees it.
-        std::fs::write(
-            dir.join("scripts/sign-plugin.mjs"),
-            "process.stdout.write(Buffer.from('x').toString('hex'));",
-        )
-        .unwrap();
-        scan_tree(&dir).unwrap();
-
-        // Any other file under scripts/ is ordinary source.
-        std::fs::write(dir.join("scripts/other.mjs"), "process.exit(0)").unwrap();
-        let error = scan_tree(&dir).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "scripts/other.mjs:1 process",
-            "{error:?}"
-        );
-        std::fs::remove_file(dir.join("scripts/other.mjs")).unwrap();
-
-        // Naming it in prose is not importing it, and every plugin's comments will do exactly
-        // that — telling the author to run it is the whole point of shipping it.
-        std::fs::write(
-            dir.join("main.ts"),
-            "// Sign before pushing: node scripts/sign-plugin.mjs sign\nexport default 1;",
-        )
-        .unwrap();
-        scan_tree(&dir).unwrap();
-
-        // And importing the signer is refused, so it cannot be smuggled into the bundle.
-        std::fs::write(dir.join("main.ts"), "import './scripts/sign-plugin.mjs';").unwrap();
-        assert!(matches!(
-            scan_tree(&dir).unwrap_err(),
-            PolicyError::Violation {
-                rule: "references a tooling config",
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn the_tree_scan_skips_git_and_refuses_symlinks() {
-        let dir = scratch_dir("policy-tree");
-        std::fs::create_dir_all(dir.join(".git")).unwrap();
-        std::fs::write(dir.join(".git/hook.js"), "eval(x)").unwrap();
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/b.tsx"), "clean").unwrap();
-        std::fs::write(dir.join("main.ts"), "clean").unwrap();
-        std::fs::write(dir.join("README.md"), "eval( in prose is fine").unwrap();
-        assert_eq!(scan_tree(&dir), Ok(()));
-
-        std::fs::write(dir.join("src/c.js"), "window.x").unwrap();
-        assert_eq!(
-            scan_tree(&dir),
-            Err(PolicyError::Violation {
-                file: "src/c.js".to_owned(),
-                line: 1,
-                rule: "window",
-            })
-        );
-        std::fs::remove_file(dir.join("src/c.js")).unwrap();
-
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink("/etc/hostname", dir.join("link.ts")).unwrap();
-            assert!(matches!(scan_tree(&dir), Err(PolicyError::Symlink(_))));
-        }
-        std::fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn the_tree_scan_bounds_file_count_and_size() {
-        let dir = scratch_dir("policy-bounds");
-        for i in 0..=super::MAX_SOURCE_FILES {
-            std::fs::write(dir.join(format!("f{i}.ts")), "x").unwrap();
-        }
-        assert_eq!(scan_tree(&dir), Err(PolicyError::TooManyFiles));
-        std::fs::remove_dir_all(&dir).ok();
-
-        let dir = scratch_dir("policy-size");
-        // Ordinary-looking lines, so the size limit is what refuses this and not the shape rules.
-        let line = format!("{};\n", "x".repeat(99));
-        let mut big = String::new();
-        while u64::try_from(big.len()).unwrap() <= super::MAX_SOURCE_BYTES {
-            big.push_str(&line);
-        }
-        std::fs::write(dir.join("a.ts"), &big).unwrap();
-        std::fs::write(dir.join("b.ts"), "y").unwrap();
-        assert_eq!(scan_tree(&dir), Err(PolicyError::TooLarge));
-        std::fs::remove_dir_all(dir).ok();
-    }
-}
+mod tests;

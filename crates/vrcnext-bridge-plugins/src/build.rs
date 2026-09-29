@@ -10,6 +10,13 @@
 //! The bundle is built to a temporary file beside the real one and renamed into place on
 //! success, so a failed build leaves the previous bundle — and the user's working page — exactly
 //! as it was.
+//!
+//! esbuild resolves whatever a plugin imports, and a relative specifier can climb out of the
+//! plugin's directory: `import s from '../../state.json'` would inline every plugin's settings,
+//! and `../../host/packages/host/src/…` would hand a plugin the host's own module instances,
+//! past the permission gate. The source policy refuses the obvious spellings, but the resolver is
+//! the authority on what a specifier means, so every build also asks esbuild for its metafile and
+//! refuses the bundle unless each input is one a plugin may reach: see [`check_inputs`].
 
 use std::fmt::Write as _;
 use std::io::Read;
@@ -81,6 +88,8 @@ enum BuildError {
     Timeout,
     #[error("esbuild failed:\n{0}")]
     Failed(String),
+    #[error("{0}")]
+    Boundary(String),
 }
 
 /// The real builder.
@@ -119,9 +128,12 @@ impl EsbuildBuilder {
         std::fs::create_dir_all(&staging)
             .map_err(|error| BuildError::Write(staging.display().to_string(), error.to_string()))?;
         let staged = staging.join(vrcnext_bridge_core::paths::BUNDLE_NAME);
+        let metafile = staging.join(METAFILE_NAME);
 
         log::info!("build: running esbuild");
-        let outcome = run_esbuild(&self.paths, &staged)
+        let outcome = run_esbuild(&self.paths, &staged, &metafile)
+            .and_then(|()| read_metafile(&metafile))
+            .and_then(|meta| check_inputs(&meta, plugins).map_err(BuildError::Boundary))
             .and_then(|()| write_theme_info(self.paths.theme_dir()))
             .and_then(|()| self.promote(&staged));
         // Whatever happened, the staging directory is scratch; only the renames are a result.
@@ -219,9 +231,92 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// The fixed argument list. `outfile` is the staging path; everything else is relative to the
-/// data root, which is the working directory.
-fn esbuild_args(outfile: &Path) -> Vec<String> {
+/// The metafile's name inside the staging directory, which is removed after every build.
+const METAFILE_NAME: &str = "meta.json";
+
+/// Where the plugin API's sources live. A plugin may import anything under it: it is the public
+/// surface, and it imports nothing from the host.
+const API_DIR: &str = "host/packages/api/src/";
+
+/// Where every host package lives. Only the host and the API may be inputs from here.
+const HOST_DIR: &str = "host/packages/";
+
+/// Read the metafile esbuild wrote beside the staged bundle.
+fn read_metafile(path: &Path) -> Result<serde_json::Value, BuildError> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| BuildError::Boundary(format!("esbuild wrote no metafile: {error}")))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| BuildError::Boundary(format!("esbuild's metafile is unreadable: {error}")))
+}
+
+/// Refuse a bundle that read a file no plugin may reach.
+///
+/// The metafile lists every input the bundle was made from, relative to the data root, and every
+/// import edge each one resolved. The rules:
+///
+/// - every input is under `host/packages/`, is the generated `build/static-plugins.ts`, or is
+///   under `plugins/<id>/` for a plugin in this build — nothing else on disk (`state.json`, a
+///   config file, a data: URL) may be bundled;
+/// - a file under `plugins/<id>/` imports only its own plugin's files and the plugin API, never
+///   the host's internals or another plugin;
+/// - a file of the plugin API imports only the plugin API, so it cannot be a stepping stone;
+/// - no plugin input is a test file (`*.test.*`, `*.spec.*`): the source policy does not scan
+///   those, so they must never reach the page.
+///
+/// # Errors
+///
+/// A one-line reason naming the first input or edge that broke a rule.
+pub fn check_inputs(meta: &serde_json::Value, plugins: &[PluginId]) -> Result<(), String> {
+    let inputs = meta
+        .get("inputs")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "esbuild's metafile lists no inputs".to_owned())?;
+    for (input, detail) in inputs {
+        // esbuild writes `/` everywhere, but a rule that a backslash could dodge is no rule.
+        let input = &input.replace('\\', "/");
+        let owner = plugin_of(input, plugins);
+        let allowed = input.starts_with(HOST_DIR) || input == STATIC_PLUGINS || owner.is_some();
+        if !allowed {
+            return Err(format!("the bundle may not include {input}"));
+        }
+        if owner.is_some() && crate::policy::is_test_file(input) {
+            return Err(format!("{input} is a test file and may not be bundled"));
+        }
+        let imports = detail
+            .get("imports")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        // An edge esbuild left external (a type-only import it erased) bundled nothing.
+        for target in imports
+            .iter()
+            .filter(|edge| edge.get("external").and_then(serde_json::Value::as_bool) != Some(true))
+            .filter_map(|edge| edge.get("path").and_then(serde_json::Value::as_str))
+            .map(|target| target.replace('\\', "/"))
+        {
+            let reachable = match owner {
+                Some(id) => target.starts_with(API_DIR) || plugin_of(&target, plugins) == Some(id),
+                None if input.starts_with(API_DIR) => target.starts_with(API_DIR),
+                None => true,
+            };
+            if !reachable {
+                return Err(format!("{input} may not import {target}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The plugin in this build whose directory holds `path`, if any.
+fn plugin_of<'a>(path: &str, plugins: &'a [PluginId]) -> Option<&'a PluginId> {
+    let rest = path.strip_prefix("plugins/")?;
+    let (dir, _) = rest.split_once('/')?;
+    plugins.iter().find(|id| id.as_str() == dir)
+}
+
+/// The fixed argument list. `outfile` is the staging path and `metafile` sits beside it;
+/// everything else is relative to the data root, which is the working directory.
+fn esbuild_args(outfile: &Path, metafile: &Path) -> Vec<String> {
     vec![
         HOST_ENTRY.to_owned(),
         "--bundle".to_owned(),
@@ -237,15 +332,16 @@ fn esbuild_args(outfile: &Path) -> Vec<String> {
         format!("--alias:@vrcnext/plugin-api=./{API_ENTRY}"),
         format!("--alias:@vrcnext/static-plugins=./{STATIC_PLUGINS}"),
         format!("--outfile={}", outfile.display()),
+        format!("--metafile={}", metafile.display()),
         "--log-level=warning".to_owned(),
         "--color=false".to_owned(),
     ]
 }
 
 /// Spawn esbuild with a cleared environment, capture its output, and enforce the deadline.
-fn run_esbuild(paths: &Paths, outfile: &Path) -> Result<(), BuildError> {
+fn run_esbuild(paths: &Paths, outfile: &Path, metafile: &Path) -> Result<(), BuildError> {
     let mut child = Command::new(paths.esbuild())
-        .args(esbuild_args(outfile))
+        .args(esbuild_args(outfile, metafile))
         .current_dir(paths.root())
         .env_clear()
         .stdin(Stdio::null())
@@ -334,8 +430,11 @@ mod tests {
     use sha2::Digest as _;
     use vrcnext_bridge_core::{Paths, PluginId, Pusher, RecordingPusher};
 
-    use super::{Builder as _, EsbuildBuilder, generate_static_plugins, hex, verify_checksum};
+    use super::{
+        Builder as _, EsbuildBuilder, check_inputs, generate_static_plugins, hex, verify_checksum,
+    };
     use crate::fsutil::scratch_dir;
+    use crate::policy::is_test_file;
 
     fn ids(names: &[&str]) -> Vec<PluginId> {
         names.iter().map(|n| PluginId::parse(n).unwrap()).collect()
@@ -412,8 +511,10 @@ mod tests {
         std::fs::create_dir_all(paths.bin_dir()).unwrap();
         std::fs::create_dir_all(paths.root().join("host/packages/host/src")).unwrap();
         std::fs::write(paths.root().join(super::HOST_ENTRY), "").unwrap();
-        let script = "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --outfile=*) out=\"${a#--outfile=}\";; esac; done\n\
-                      printf '%s\\n' \"$@\" > \"$out\"\nprintf '{}' > \"$out.map\"\n";
+        let script = "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --outfile=*) out=\"${a#--outfile=}\";; \
+                      --metafile=*) meta=\"${a#--metafile=}\";; esac; done\n\
+                      printf '%s\\n' \"$@\" > \"$out\"\nprintf '{}' > \"$out.map\"\n\
+                      printf '{\"inputs\":{\"host/packages/host/src/index.ts\":{\"imports\":[]}}}' > \"$meta\"\n";
         std::fs::write(paths.esbuild(), script).unwrap();
         std::fs::set_permissions(paths.esbuild(), std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(paths.esbuild_checksum(), hex(&sha2::Sha256::digest(script))).unwrap();
@@ -424,6 +525,7 @@ mod tests {
         let argv = std::fs::read_to_string(paths.bundle()).unwrap();
         assert!(argv.contains("--alias:@vrcnext/static-plugins=./build/static-plugins.ts"));
         assert!(argv.contains("--format=iife"));
+        assert!(argv.contains("--metafile="));
         assert!(paths.bundle().with_extension("js.map").is_file());
         assert!(!super::staging_bundle(&paths).exists());
         assert!(paths.theme_dir().join("info.json").is_file());
@@ -441,5 +543,131 @@ mod tests {
         assert!(report.errors[0].contains("boom"));
         assert_eq!(std::fs::read_to_string(paths.bundle()).unwrap(), argv);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A metafile with these inputs, each importing the listed paths.
+    fn meta(inputs: &[(&str, &[&str])]) -> serde_json::Value {
+        let inputs: serde_json::Map<String, serde_json::Value> = inputs
+            .iter()
+            .map(|(input, imports)| {
+                let imports: Vec<_> = imports
+                    .iter()
+                    .map(|path| serde_json::json!({ "path": path, "kind": "import-statement" }))
+                    .collect();
+                (
+                    (*input).to_owned(),
+                    serde_json::json!({ "imports": imports }),
+                )
+            })
+            .collect();
+        serde_json::json!({ "inputs": inputs })
+    }
+
+    /// The shape of a real build: the host, the API, the generated table and one plugin.
+    const HOST: (&str, &[&str]) = (
+        "host/packages/host/src/index.ts",
+        &["host/packages/api/src/index.ts", "build/static-plugins.ts"],
+    );
+    const API: (&str, &[&str]) = (
+        "host/packages/api/src/index.ts",
+        &["host/packages/api/src/kit.ts"],
+    );
+    const TABLE: (&str, &[&str]) = (
+        "build/static-plugins.ts",
+        &["plugins/ab/main.ts", "plugins/ab/plugin.json"],
+    );
+
+    #[test]
+    fn an_ordinary_build_passes_the_boundary_check() {
+        let plugin: (&str, &[&str]) = (
+            "plugins/ab/main.ts",
+            &["host/packages/api/src/index.ts", "plugins/ab/src/panel.ts"],
+        );
+        let panel: (&str, &[&str]) = ("plugins/ab/src/panel.ts", &["plugins/ab/src/data.json"]);
+        let data: (&str, &[&str]) = ("plugins/ab/src/data.json", &[]);
+        let json: (&str, &[&str]) = ("plugins/ab/plugin.json", &[]);
+        let all = meta(&[HOST, API, TABLE, plugin, panel, data, json]);
+        assert_eq!(check_inputs(&all, &ids(&["ab"])), Ok(()));
+    }
+
+    #[test]
+    fn a_plugin_cannot_bundle_a_file_outside_its_own_directory() {
+        // The audit's reproduction: state.json and a VRCNext config inlined through `../`.
+        for (target, refused) in [
+            ("state.json", "state.json"),
+            (
+                "../.config/VRCNext/settings.json",
+                "../.config/VRCNext/settings.json",
+            ),
+            (
+                "data:text/javascript,export default 1",
+                "data:text/javascript,export default 1",
+            ),
+        ] {
+            let plugin: (&str, &[&str]) = ("plugins/ab/main.ts", &[target]);
+            let file: (&str, &[&str]) = (target, &[]);
+            let error =
+                check_inputs(&meta(&[HOST, API, TABLE, plugin, file]), &ids(&["ab"])).unwrap_err();
+            assert!(error.contains(refused), "{target}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_plugin_cannot_import_the_host_or_another_plugin() {
+        for target in [
+            "host/packages/host/src/permissions/broker.ts",
+            "plugins/cd/src/secret.ts",
+        ] {
+            let plugin: (&str, &[&str]) = ("plugins/ab/main.ts", &[target]);
+            let file: (&str, &[&str]) = (target, &[]);
+            let error = check_inputs(
+                &meta(&[HOST, API, TABLE, plugin, file]),
+                &ids(&["ab", "cd"]),
+            )
+            .unwrap_err();
+            assert_eq!(error, format!("plugins/ab/main.ts may not import {target}"));
+        }
+        // Nor can it reach a plugin that is on disk but not in this build.
+        let plugin: (&str, &[&str]) = ("plugins/ab/main.ts", &["plugins/zz/x.ts"]);
+        let file: (&str, &[&str]) = ("plugins/zz/x.ts", &[]);
+        assert!(check_inputs(&meta(&[HOST, plugin, file]), &ids(&["ab"])).is_err());
+    }
+
+    #[test]
+    fn the_plugin_api_cannot_be_a_stepping_stone_into_the_host() {
+        let api: (&str, &[&str]) = (
+            "host/packages/api/src/index.ts",
+            &["host/packages/host/src/index.ts"],
+        );
+        assert!(check_inputs(&meta(&[HOST, api]), &ids(&[])).is_err());
+    }
+
+    #[test]
+    fn test_files_are_never_bundled_from_a_plugin() {
+        let plugin: (&str, &[&str]) = ("plugins/ab/main.ts", &["plugins/ab/src/a.test.ts"]);
+        let test: (&str, &[&str]) = ("plugins/ab/src/a.test.ts", &[]);
+        let error = check_inputs(&meta(&[HOST, TABLE, plugin, test]), &ids(&["ab"])).unwrap_err();
+        assert!(error.contains("test file"), "{error}");
+        assert!(is_test_file("src/a.test.ts"));
+        assert!(is_test_file("a.spec.JS"));
+        assert!(is_test_file("a.test.d.ts"));
+        assert!(!is_test_file("src/test.ts"));
+        assert!(!is_test_file("src/latest.ts"));
+        assert!(!is_test_file("src/tests/a.ts"));
+    }
+
+    #[test]
+    fn an_erased_type_import_is_not_an_edge() {
+        let api = serde_json::json!({ "inputs": {
+            "host/packages/api/src/a.ts": { "imports": [
+                { "path": "./time.js", "kind": "import-statement", "external": true }
+            ] }
+        } });
+        assert_eq!(check_inputs(&api, &ids(&[])), Ok(()));
+    }
+
+    #[test]
+    fn a_metafile_without_inputs_is_refused() {
+        assert!(check_inputs(&serde_json::json!({}), &ids(&[])).is_err());
     }
 }
