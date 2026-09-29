@@ -37,6 +37,9 @@ unit) enables the REST surface and `remote/eval`.
   licence) and this file, nothing else. When behaviour changes, update the site pages named below
   in the same piece of work.
 - Commit messages end with a `Co-Authored-By:` trailer naming the model that wrote the commit.
+- **Workflows run only by hand.** Every workflow's only trigger is `workflow_dispatch`; automatic
+  triggers (`push`, `pull_request`, tags, schedules) stay commented out. Never run a workflow
+  yourself — the owner dispatches them.
 - Never drive VRCNext with a synthetic mouse or keyboard, and restart or reload it sparingly —
   both re-authenticate against VRChat. Inspect the page through the bridge's `remote` service
   (`vrcnext-eval '<async body>'`, bridge started with `--dev`).
