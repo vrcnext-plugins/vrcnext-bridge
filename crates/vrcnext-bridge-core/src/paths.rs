@@ -30,6 +30,7 @@ pub const BUNDLE_NAME: &str = "vrcnext-plugin-host.js";
 pub struct Paths {
     root: PathBuf,
     theme_dir: PathBuf,
+    vrcnext_config: PathBuf,
 }
 
 /// Why the platform directories could not be determined.
@@ -50,6 +51,7 @@ impl Paths {
         Self {
             root,
             theme_dir: vrcnext_config.join("custom-themes").join(THEME_NAME),
+            vrcnext_config: vrcnext_config.to_path_buf(),
         }
     }
 
@@ -148,6 +150,15 @@ impl Paths {
     #[must_use]
     pub fn theme_dir(&self) -> &Path {
         &self.theme_dir
+    }
+
+    /// VRCNext's own configuration directory, which is also where it keeps its databases.
+    ///
+    /// Found through the platform's config directory rather than assembled from the home
+    /// directory, so it is `%APPDATA%\VRCNext` on Windows and `~/.config/VRCNext` here.
+    #[must_use]
+    pub fn vrcnext_config(&self) -> &Path {
+        &self.vrcnext_config
     }
 
     /// The bundle the page loads.

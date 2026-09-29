@@ -28,6 +28,7 @@ pub mod outbound;
 pub mod policy;
 pub mod service;
 pub mod signing;
+pub mod sql;
 pub mod state;
 pub mod trust;
 
@@ -37,5 +38,6 @@ pub use manifest::Manifest;
 pub use outbound::HttpService;
 pub use service::PluginsService;
 pub use signing::{SignatureError, VerifiedSignature, tree_digest, verify};
+pub use sql::SqlService;
 pub use state::{StateService, StateStore};
 pub use trust::{TrustStore, TrustedKey};

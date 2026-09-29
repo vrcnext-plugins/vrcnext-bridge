@@ -12,7 +12,8 @@ use vrcnext_bridge_core::{
     Approver, NullApprover, OscService, Paths, Pusher, RemoteService, Service, ServiceRegistry,
 };
 use vrcnext_bridge_plugins::{
-    Builder, EsbuildBuilder, Git, GixGit, HttpService, PluginsService, StateService, StateStore,
+    Builder, EsbuildBuilder, Git, GixGit, HttpService, PluginsService, SqlService, StateService,
+    StateStore,
 };
 use vrcnext_bridge_sinks::WayvrSink;
 
@@ -63,6 +64,12 @@ pub(crate) fn build_services(
     registry.register(Arc::new(LogService::new(Arc::clone(&log_writer))) as Arc<dyn Service>);
     registry.register(Arc::new(StateService::new(state)) as Arc<dyn Service>);
     registry.register(Arc::new(HttpService::new()) as Arc<dyn Service>);
+    // Registered whether or not VRCNext's databases are there: a missing file is an answer the
+    // page can act on, and hiding the service would make the whole capability undiscoverable on a
+    // machine where VRCNext simply has not written one yet.
+    registry.register(
+        Arc::new(SqlService::new(paths.vrcnext_config().to_path_buf())) as Arc<dyn Service>,
+    );
     registry.register(Arc::new(plugins) as Arc<dyn Service>);
 
     Ok(Wiring {

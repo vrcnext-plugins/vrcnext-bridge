@@ -42,6 +42,12 @@ gix = { version = "0.88", default-features = false, features = [
 ] }
 # SHA-256 for the esbuild checksum and the plugin tree digest.
 sha2 = "0.11"
+# SQLite for the `sql` service, which reads VRCNext's own databases. `bundled` compiles SQLite
+# from the vendored C source rather than linking the system library: this host is an immutable OS
+# where a shared libsqlite is not ours to depend on, and the version is then the one the tests ran
+# against. Deliberately no `hooks` or `load_extension`: the service never runs a callback out of
+# SQLite and never loads an extension, which would be arbitrary native code from a plugin's query.
+rusqlite = { version = "0.38", features = ["bundled", "column_decltype"] }
 # Ed25519 verification for plugin signatures. Pure Rust, no OS crypto library.
 ed25519-dalek = { version = "3", default-features = false, features = ["fast"] }
 # Outbound HTTP for the `outbound` service. Already in the tree through gix's transport, so this
