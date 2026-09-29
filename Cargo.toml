@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Unlicense"
@@ -11,10 +11,10 @@ repository = "https://github.com/vrcnext-plugins/vrcnext-bridge"
 authors = ["vrcnext-plugins"]
 
 [workspace.dependencies]
-vrcnext-bridge-core = { path = "crates/vrcnext-bridge-core", version = "0.5.0" }
-vrcnext-bridge-sinks = { path = "crates/vrcnext-bridge-sinks", version = "0.5.0" }
-vrcnext-bridge-plugins = { path = "crates/vrcnext-bridge-plugins", version = "0.5.0" }
-vrcnext-bridge-win = { path = "crates/vrcnext-bridge-win", version = "0.5.0" }
+vrcnext-bridge-core = { path = "crates/vrcnext-bridge-core", version = "0.6.0" }
+vrcnext-bridge-sinks = { path = "crates/vrcnext-bridge-sinks", version = "0.6.0" }
+vrcnext-bridge-plugins = { path = "crates/vrcnext-bridge-plugins", version = "0.6.0" }
+vrcnext-bridge-win = { path = "crates/vrcnext-bridge-win", version = "0.6.0" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
