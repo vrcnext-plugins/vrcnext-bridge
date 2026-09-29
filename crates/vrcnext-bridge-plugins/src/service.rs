@@ -14,8 +14,18 @@
 //! a key that differs from the one the plugin was installed under is confirmed *every* time,
 //! separately, because that is what an account takeover looks like from here.
 //!
-//! One mutex serialises everything that changes the installed set or runs a build. Reads
-//! (`list`, `check_updates`) do not take it.
+//! A signature says who made a tree, not that it is the newest one they made. Someone who
+//! controls the repository but not the key could point it back at an older signed commit — one
+//! with a known bug — and it would verify. So an update is also refused if its `version` is lower
+//! than the installed one, or if its signature is older than the one it replaces; going back on
+//! purpose is an uninstall and a fresh install.
+//!
+//! An install or update is only finished once the bundle builds with it. If the build fails, the
+//! previous tree (or no tree, for an install) is put back and the bundle rebuilt without it, so a
+//! plugin that cannot compile never wedges every later build.
+//!
+//! One mutex serialises everything that changes the installed set, runs a build, or touches a
+//! plugin's git directory. `list` does not take it.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -71,6 +81,10 @@ struct Record {
     updated_at: u64,
     /// The signing key this plugin belongs to.
     key_id: String,
+    /// When the installed tree says it was signed. An update signed earlier is a rollback.
+    /// Absent in records written before this was kept, which then compare as zero.
+    #[serde(default)]
+    signed_at: u64,
 }
 
 /// Everything the service is built from.
@@ -114,6 +128,30 @@ struct Candidate {
 
 fn bad(code: &str, detail: impl std::fmt::Display) -> ServiceError {
     ServiceError::BadRequest(format!("{code}: {detail}"))
+}
+
+/// The refusal for a change that was rolled back because the bundle would not build with it.
+fn build_failed(report: &BuildReport) -> ServiceError {
+    bad(
+        "build_failed",
+        report
+            .errors
+            .first()
+            .map_or("the bundle did not build", String::as_str),
+    )
+}
+
+/// A manifest version as numbers, for ordering. Manifests are validated as plain
+/// `MAJOR.MINOR.PATCH`, so anything else does not reach here; it would sort as zero.
+fn version_key(version: &str) -> [u64; 3] {
+    let mut parts = version
+        .split('.')
+        .map(|part| part.parse::<u64>().unwrap_or(0));
+    [
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    ]
 }
 
 fn now_ms() -> u64 {
@@ -513,6 +551,7 @@ impl PluginsService {
                 installed_at: now,
                 updated_at: now,
                 key_id: candidate.signature.key_id,
+                signed_at: candidate.signature.signed_at,
             },
         )?;
         self.push_installed();
@@ -522,7 +561,24 @@ impl PluginsService {
             "build",
             "rebuilding the bundle",
         );
-        self.rebuild();
+        let report = self.rebuild();
+        if !report.ok {
+            // Take it out again, so the plugins that were working keep working.
+            self.progress(
+                "install",
+                Some(&candidate.id),
+                "rollback",
+                "the bundle did not build",
+            );
+            let _ = std::fs::remove_dir_all(&target);
+            let _ = self.state.delete(RECORDS_NS, candidate.id.as_str());
+            let _ = self
+                .state
+                .delete_namespace(&format!("plugin:{}", candidate.id));
+            self.push_installed();
+            self.rebuild();
+            return Err(build_failed(&report));
+        }
         self.finished(&candidate.id, &candidate.manifest.name)
     }
 
@@ -561,19 +617,37 @@ impl PluginsService {
                 let _ = std::fs::remove_dir_all(&candidate.dir);
                 ServiceError::Internal(format!("cannot swap the plugin tree: {error}"))
             })?;
-        let _ = std::fs::remove_dir_all(&retired);
+        let previous = record.clone();
         self.save_record(
             &id,
             &Record {
                 commit: candidate.commit,
                 updated_at: now_ms(),
                 key_id: candidate.signature.key_id,
+                signed_at: candidate.signature.signed_at,
                 ..record
             },
         )?;
         self.push_installed();
         self.progress("update", Some(&id), "build", "rebuilding the bundle");
-        self.rebuild();
+        let report = self.rebuild();
+        if !report.ok {
+            // Put the tree that built back, and the record that describes it.
+            self.progress("update", Some(&id), "rollback", "the bundle did not build");
+            let failed = self.temp_dir()?;
+            if std::fs::rename(&target, &failed)
+                .and_then(|()| std::fs::rename(&retired, &target))
+                .is_ok()
+            {
+                let _ = self.save_record(&id, &previous);
+            }
+            let _ = std::fs::remove_dir_all(&failed);
+            let _ = std::fs::remove_dir_all(&retired);
+            self.push_installed();
+            self.rebuild();
+            return Err(build_failed(&report));
+        }
+        let _ = std::fs::remove_dir_all(&retired);
         self.finished(&id, &candidate.manifest.name)
     }
 
@@ -589,6 +663,24 @@ impl PluginsService {
             return Err(bad(
                 "manifest_invalid",
                 format!("the repository now declares id '{}'", candidate.id),
+            ));
+        }
+        if let Some(installed) = self.entry(id).map(|entry| entry.manifest.version)
+            && version_key(&candidate.manifest.version) < version_key(&installed)
+        {
+            return Err(bad(
+                "downgrade",
+                format!(
+                    "the repository now offers {} but {installed} is installed; uninstall and \
+                     install again to go back on purpose",
+                    candidate.manifest.version
+                ),
+            ));
+        }
+        if candidate.signature.signed_at < record.signed_at {
+            return Err(bad(
+                "downgrade",
+                "the repository now offers a tree signed before the installed one",
             ));
         }
         self.confirm_key_change(id, &record.key_id, &candidate.signature)?;
@@ -630,6 +722,8 @@ impl PluginsService {
     }
 
     fn check_updates(&self) -> Value {
+        // Fetching writes into `plugins/<id>/.git`, the directory an update renames away.
+        let _guard = self.lock();
         let mut updates = Vec::new();
         for id in self.installed_ids() {
             match self.git.fetch_status(&self.paths.plugin_dir(&id)) {

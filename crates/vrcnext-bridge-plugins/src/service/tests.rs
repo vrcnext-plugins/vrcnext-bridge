@@ -36,6 +36,11 @@ const AUTHOR: u8 = 1;
 /// fixtures exercise the real [`crate::signing::tree_digest`] rather than a copy of it that
 /// could drift away from it.
 fn sign(tree: Tree, seed: u8) -> Tree {
+    sign_at(tree, seed, 1_759_000_000)
+}
+
+/// [`sign`], claiming to have been signed at `signed_at`.
+fn sign_at(tree: Tree, seed: u8, signed_at: u64) -> Tree {
     use ed25519_dalek::{Signer as _, SigningKey};
 
     let id = tree
@@ -66,7 +71,7 @@ fn sign(tree: Tree, seed: u8) -> Tree {
         "publicKey": hex(&key.verifying_key().to_bytes()),
         "digest": digest,
         "signature": hex(&key.sign(&crate::signing::message(&id, &digest)).to_bytes()),
-        "signedAt": 1_759_000_000,
+        "signedAt": signed_at,
     });
     let mut tree = tree;
     tree.push(("plugin.sig", file.to_string()));
@@ -137,17 +142,25 @@ impl Git for FakeGit {
 #[derive(Default)]
 struct FakeBuilder {
     calls: Mutex<Vec<Vec<String>>>,
+    /// A plugin whose presence makes the build fail, as a compile error in it would.
+    broken: Mutex<Option<&'static str>>,
 }
 
 impl Builder for FakeBuilder {
     fn build(&self, plugins: &[PluginId]) -> BuildReport {
         let ids: Vec<String> = plugins.iter().map(ToString::to_string).collect();
         self.calls.lock().unwrap().push(ids.clone());
+        let broken = *self.broken.lock().unwrap();
+        let ok = !broken.is_some_and(|id| ids.iter().any(|installed| installed == id));
         BuildReport {
-            ok: true,
+            ok,
             duration_ms: 1,
             plugins: ids,
-            errors: Vec::new(),
+            errors: if ok {
+                Vec::new()
+            } else {
+                vec!["esbuild failed: boom".to_owned()]
+            },
         }
     }
 }
@@ -809,4 +822,107 @@ fn a_record_without_a_key_must_be_reinstalled_but_can_be_uninstalled() {
         .call("uninstall", json!({ "id": "friend-alerts" }))
         .unwrap();
     assert!(r.state.get(RECORDS_NS, "friend-alerts").is_none());
+}
+
+#[test]
+fn an_update_to_a_lower_version_is_refused() {
+    let r = installed("downgrade-version");
+    let mut newer = good_tree();
+    newer[0] = ("plugin.json", manifest("1.2.0"));
+    r.git.serve(URL, newer);
+    r.service
+        .call("update", json!({ "id": "friend-alerts" }))
+        .unwrap();
+
+    // The repository is pointed back at the 1.0.0 tree, still validly signed.
+    r.git.serve(URL, good_tree());
+    let error = r
+        .service
+        .call("update", json!({ "id": "friend-alerts" }))
+        .unwrap_err();
+    assert_eq!(code(&error), "downgrade");
+    assert_eq!(
+        r.service.call("list", json!({})).unwrap()["plugins"][0]["version"],
+        "1.2.0"
+    );
+    assert_eq!(std::fs::read_dir(r.paths.plugins_dir()).unwrap().count(), 1);
+}
+
+#[test]
+fn an_update_signed_before_the_installed_tree_is_refused() {
+    let r = rig("downgrade-signed", Approval::Approved);
+    r.git
+        .serve_raw(URL, sign_at(good_tree(), AUTHOR, 1_800_000_000));
+    r.service.call("install", json!({ "url": URL })).unwrap();
+
+    // Same version, same key, older signature: an old commit put back.
+    let mut older = good_tree();
+    older[2] = ("src/util.ts", "export const x = 0".to_owned());
+    r.git.serve_raw(URL, sign_at(older, AUTHOR, 1_700_000_000));
+    let error = r
+        .service
+        .call("update", json!({ "id": "friend-alerts" }))
+        .unwrap_err();
+    assert_eq!(code(&error), "downgrade");
+
+    // A newer signature of the same version is an ordinary update.
+    let mut newer = good_tree();
+    newer[2] = ("src/util.ts", "export const x = 2".to_owned());
+    r.git.serve_raw(URL, sign_at(newer, AUTHOR, 1_900_000_000));
+    r.service
+        .call("update", json!({ "id": "friend-alerts" }))
+        .unwrap();
+}
+
+#[test]
+fn an_install_that_breaks_the_build_is_rolled_back() {
+    let r = rig("install-broken", Approval::Approved);
+    *r.builder.broken.lock().unwrap() = Some("friend-alerts");
+    r.git.serve(URL, good_tree());
+    let error = r
+        .service
+        .call("install", json!({ "url": URL }))
+        .unwrap_err();
+    assert_eq!(code(&error), "build_failed");
+    let id = PluginId::parse("friend-alerts").unwrap();
+    assert!(!r.paths.plugin_dir(&id).exists());
+    assert_eq!(
+        r.service.call("list", json!({})).unwrap()["plugins"],
+        json!([])
+    );
+    // The bundle was rebuilt without it, so the plugins that worked still do.
+    assert_eq!(
+        r.builder.calls.lock().unwrap().last().unwrap(),
+        &Vec::<String>::new()
+    );
+    assert_eq!(std::fs::read_dir(r.paths.plugins_dir()).unwrap().count(), 0);
+}
+
+#[test]
+fn an_update_that_breaks_the_build_puts_the_old_tree_back() {
+    let r = installed("update-broken");
+    let mut tree = good_tree();
+    tree[0] = ("plugin.json", manifest("1.1.0"));
+    tree[2] = ("src/util.ts", "export const x = 2".to_owned());
+    r.git.serve(URL, tree);
+    *r.builder.broken.lock().unwrap() = Some("friend-alerts");
+    let error = r
+        .service
+        .call("update", json!({ "id": "friend-alerts" }))
+        .unwrap_err();
+    assert_eq!(code(&error), "build_failed");
+    *r.builder.broken.lock().unwrap() = None;
+
+    let id = PluginId::parse("friend-alerts").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(r.paths.plugin_dir(&id).join("src/util.ts")).unwrap(),
+        "export const x = 1"
+    );
+    assert_eq!(
+        r.service.call("list", json!({})).unwrap()["plugins"][0]["version"],
+        "1.0.0"
+    );
+    assert_eq!(std::fs::read_dir(r.paths.plugins_dir()).unwrap().count(), 1);
+    // Its settings survive: it was never uninstalled.
+    assert_eq!(r.state.get("plugin:friend-alerts", "k"), Some(json!(1)));
 }
