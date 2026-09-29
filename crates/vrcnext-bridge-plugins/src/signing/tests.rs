@@ -205,3 +205,28 @@ fn a_symlink_anywhere_in_the_tree_is_refused() {
     );
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn a_weak_key_is_refused_even_when_its_signature_checks_out() {
+    // The identity point as the key, and R = identity, s = 0 as the signature: the lax check
+    // accepts this for every message, so it would "sign" any tree at all.
+    let dir = scratch_dir("sign-weak");
+    for (path, content) in FILES {
+        let full = dir.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, content).unwrap();
+    }
+    let identity = format!("01{}", "00".repeat(31));
+    let file = serde_json::json!({
+        "version": 1,
+        "algorithm": "ed25519",
+        "id": "demo",
+        "publicKey": identity,
+        "digest": tree_digest(&dir).unwrap(),
+        "signature": format!("{identity}{}", "00".repeat(32)),
+        "signedAt": 1_759_000_000,
+    });
+    std::fs::write(dir.join(SIGNATURE_FILE), file.to_string()).unwrap();
+    assert_eq!(verify(&dir, "demo").unwrap_err(), SignatureError::Invalid);
+    std::fs::remove_dir_all(&dir).ok();
+}

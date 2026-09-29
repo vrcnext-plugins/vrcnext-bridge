@@ -34,7 +34,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use ed25519_dalek::{Signature as DalekSignature, Verifier as _, VerifyingKey};
+use ed25519_dalek::{Signature as DalekSignature, VerifyingKey};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
@@ -255,7 +255,10 @@ pub fn verify(root: &Path, id: &str) -> Result<VerifiedSignature, SignatureError
         return Err(SignatureError::DigestMismatch);
     }
 
-    key.verify(
+    // Strict: a weak (small-order) key or a non-canonical signature is refused. With a weak key,
+    // one signature can verify for many messages — the identity key "signs" everything — which
+    // would make "this key made this tree" mean nothing.
+    key.verify_strict(
         &message(id, &actual),
         &DalekSignature::from_bytes(&signature),
     )
