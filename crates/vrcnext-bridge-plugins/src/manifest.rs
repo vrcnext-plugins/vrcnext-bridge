@@ -22,6 +22,7 @@ pub const PERMISSIONS: &[&str] = &[
     "notifications",
     "native",
     "osc",
+    "sql",
     "gamelog",
     "vrchat",
     "context-menu",
