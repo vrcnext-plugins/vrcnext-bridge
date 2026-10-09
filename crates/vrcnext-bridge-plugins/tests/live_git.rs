@@ -28,6 +28,10 @@ fn a_depth_one_clone_and_a_fetch_work_over_https() {
     let status = GixGit.fetch_status(&dest).expect("fetch");
     assert_eq!(status.current, commit);
     assert_eq!(status.latest, commit);
-    assert!(status.changelog.is_empty());
+    assert!(
+        status.changelog.is_empty(),
+        "a fresh clone is level with its remote: {:?}",
+        status.changelog
+    );
     std::fs::remove_dir_all(dir).ok();
 }

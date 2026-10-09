@@ -1,5 +1,12 @@
 [toolchain]
-# Pinned so the lint set behaves identically for everyone; clippy's pedantic group moves between
-# releases, and a gate that passes locally must pass in CI.
-channel = "1.97.1"
+# `stable` rather than an exact version, because this is the toolchain the owner's `build-box`
+# actually has: `/opt/rust/rustup` is root-owned, so a pinned channel rustup has not installed
+# cannot be fetched and the gate simply refuses to run. A pin nobody can satisfy is worse than
+# none — it means the gate is never run at all.
+#
+# The pin existed so clippy's pedantic group, which moves between releases, behaved identically
+# for everyone. That still matters: a `stable` that rolls forward can fail the gate on a lint
+# that did not exist when the code was written. Fix the lint rather than narrowing the channel,
+# and if you fork this with working CI, pin the exact version your runner installs.
+channel = "stable"
 components = ["rustfmt", "clippy"]

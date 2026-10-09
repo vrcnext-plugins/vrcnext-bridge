@@ -38,6 +38,10 @@ fn forgetting_a_key_makes_it_unknown_again() {
     keys.record("ab-cd", "00ff", "demo", "demo", 10).unwrap();
     keys.forget("ab-cd").unwrap();
     assert!(keys.get("ab-cd").is_none());
-    assert!(keys.list().is_empty());
+    assert!(
+        keys.list().is_empty(),
+        "forgotten keys left behind: {:?}",
+        keys.list()
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

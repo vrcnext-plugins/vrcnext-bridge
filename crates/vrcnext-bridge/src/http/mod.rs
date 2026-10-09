@@ -203,6 +203,11 @@ pub(crate) async fn dispatch(
 ///
 /// `to_bytes` bounds the read independently of `Content-Length`, so a caller that lies about its
 /// length — or sends none at all — still cannot push unbounded bytes into memory.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err *is* the response to send, and its one caller returns it immediately; \
+              boxing an axum Response per request to shrink a 128-byte Err buys nothing"
+)]
 async fn read_params(body: Body) -> Result<Value, Response> {
     let bytes = to_bytes(body, limits::MAX_BODY_BYTES)
         .await
