@@ -29,9 +29,6 @@ const CLONE_DEPTH: u32 = 1;
 /// at most; fetching more would be paying for entries nobody sees.
 pub const CHANGELOG_LIMIT: u32 = 50;
 
-/// Where the clone's remote-tracking HEAD lives.
-const REMOTE_HEAD: &str = "refs/remotes/origin/HEAD";
-
 /// Why a git operation failed. The message is safe to show: it names the failure, not the
 /// repository's content.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -168,7 +165,8 @@ fn fetch_inner(path: &Path, interrupt: &AtomicBool) -> Result<RemoteStatus, GitE
     let failed = |error: gix::Error| GitError::Fetch(sanitise(&error.to_string()));
 
     let current = repo.head_id().map_err(failed)?.detach();
-    repo.find_remote("origin")
+    let outcome = repo
+        .find_remote("origin")
         .map_err(failed)?
         .connect(gix::remote::Direction::Fetch)
         .map_err(failed)?
@@ -178,12 +176,9 @@ fn fetch_inner(path: &Path, interrupt: &AtomicBool) -> Result<RemoteStatus, GitE
         .receive(Discard, interrupt)
         .map_err(failed)?;
 
-    let latest = repo
-        .find_reference(REMOTE_HEAD)
-        .map_err(failed)?
-        .into_fully_peeled_id()
-        .map_err(failed)?
-        .detach();
+    let latest = remote_tip(&outcome).ok_or_else(|| {
+        GitError::Fetch("the remote advertised no branch to compare against".to_owned())
+    })?;
 
     let changelog = if latest == current {
         Vec::new()
@@ -195,6 +190,25 @@ fn fetch_inner(path: &Path, interrupt: &AtomicBool) -> Result<RemoteStatus, GitE
         latest: latest.to_string(),
         changelog,
     })
+}
+
+/// What the remote just advertised for the branch this clone tracks.
+///
+/// Taken from the fetch's own ref map rather than from a ref in the clone, which is what this got
+/// wrong for as long as `check_updates` existed. It read `refs/remotes/origin/HEAD`, and nothing
+/// writes that ref after the clone: the only refspec is `+refs/heads/<branch>:refs/remotes/origin/<branch>`,
+/// so `origin/HEAD` stayed pinned at the commit the clone saw — which is also the local `HEAD`.
+/// `current == latest` always held, [`RemoteStatus::is_behind`] was always false, and no plugin
+/// was ever reported as having an update. Only `update` worked, because it never consults this.
+///
+/// One mapping, because the clone configures one refspec; `find_map` takes the first that resolved
+/// to an id. An unborn branch advertises none, which is the `None` the caller turns into an error.
+fn remote_tip(outcome: &gix::remote::fetch::Outcome) -> Option<gix::ObjectId> {
+    outcome
+        .ref_map
+        .mappings
+        .iter()
+        .find_map(|mapping| mapping.remote.as_id().map(ToOwned::to_owned))
 }
 
 /// Commits from `latest` back to (excluding) `current`, newest first, capped.
